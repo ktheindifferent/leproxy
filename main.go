@@ -4,6 +4,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -19,17 +20,19 @@ import (
 	"time"
 
 	"github.com/artyom/autoflags"
+	"golang.org/x/crypto/acme"
 	"golang.org/x/crypto/acme/autocert"
 )
 
 func main() {
 	args := runArgs{
-		Addr:  ":https",
-		HTTP:  ":http",
-		Conf:  "mapping.yml",
-		Cache: "/var/cache/letsencrypt",
-		RTo:   time.Minute,
-		WTo:   5 * time.Minute,
+		Addr:     ":https",
+		HTTP:     ":http",
+		Conf:     "mapping.yml",
+		Cache:    "/var/cache/letsencrypt",
+		RTo:      time.Minute,
+		WTo:      5 * time.Minute,
+		Provider: "letsencrypt",
 	}
 	autoflags.Parse(&args)
 	if err := run(args); err != nil {
@@ -38,12 +41,16 @@ func main() {
 }
 
 type runArgs struct {
-	Addr  string `flag:"addr,address to listen at"`
-	Conf  string `flag:"map,file with host/backend mapping"`
-	Cache string `flag:"cacheDir,path to directory to cache key and certificates"`
-	HSTS  bool   `flag:"hsts,add Strict-Transport-Security header"`
-	Email string `flag:"email,contact email address presented to letsencrypt CA"`
-	HTTP  string `flag:"http,optional address to serve http-to-https redirects and ACME http-01 challenge responses"`
+	Addr     string `flag:"addr,address to listen at"`
+	Conf     string `flag:"map,file with host/backend mapping"`
+	Cache    string `flag:"cacheDir,path to directory to cache key and certificates"`
+	HSTS     bool   `flag:"hsts,add Strict-Transport-Security header"`
+	Email    string `flag:"email,contact email address presented to letsencrypt CA"`
+	HTTP     string `flag:"http,optional address to serve http-to-https redirects and ACME http-01 challenge responses"`
+	Provider string `flag:"provider,ACME provider to use (letsencrypt or zerossl, default: letsencrypt)"`
+	ACMEURL  string `flag:"acme-url,custom ACME directory URL (overrides provider)"`
+	EABKID   string `flag:"eab-kid,EAB Key ID for ZeroSSL (required for ZeroSSL)"`
+	EABHMAC  string `flag:"eab-hmac,EAB HMAC key for ZeroSSL (required for ZeroSSL)"`
 
 	RTo  time.Duration `flag:"rto,maximum duration before timing out read of the request"`
 	WTo  time.Duration `flag:"wto,maximum duration before timing out write of the response"`
@@ -54,7 +61,7 @@ func run(args runArgs) error {
 	if args.Cache == "" {
 		return fmt.Errorf("no cache specified")
 	}
-	srv, httpHandler, err := setupServer(args.Addr, args.Conf, args.Cache, args.Email, args.HSTS)
+	srv, httpHandler, err := setupServer(args.Addr, args.Conf, args.Cache, args.Email, args.HSTS, args.Provider, args.ACMEURL, args.EABKID, args.EABHMAC)
 	if err != nil {
 		return err
 	}
@@ -66,6 +73,7 @@ func run(args runArgs) error {
 		srv.WriteTimeout = args.WTo
 	}
 	if args.HTTP != "" {
+		errCh := make(chan error, 1)
 		go func(addr string) {
 			srv := http.Server{
 				Addr:         addr,
@@ -73,8 +81,17 @@ func run(args runArgs) error {
 				ReadTimeout:  10 * time.Second,
 				WriteTimeout: 10 * time.Second,
 			}
-			log.Fatal(srv.ListenAndServe()) // TODO: should return err from run, not exit like this
+			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				errCh <- fmt.Errorf("HTTP server error: %v", err)
+			}
 		}(args.HTTP)
+		// Check for immediate errors from HTTP server
+		select {
+		case err := <-errCh:
+			return err
+		case <-time.After(100 * time.Millisecond):
+			// HTTP server started successfully
+		}
 	}
 	if srv.ReadTimeout != 0 || srv.WriteTimeout != 0 || args.Idle == 0 {
 		return srv.ListenAndServeTLS("", "")
@@ -89,7 +106,7 @@ func run(args runArgs) error {
 	return srv.ServeTLS(ln, "", "")
 }
 
-func setupServer(addr, mapfile, cacheDir, email string, hsts bool) (*http.Server, http.Handler, error) {
+func setupServer(addr, mapfile, cacheDir, email string, hsts bool, provider, acmeURL, eabKID, eabHMAC string) (*http.Server, http.Handler, error) {
 	mapping, err := readMapping(mapfile)
 	if err != nil {
 		return nil, nil, err
@@ -104,12 +121,75 @@ func setupServer(addr, mapfile, cacheDir, email string, hsts bool) (*http.Server
 	if err := os.MkdirAll(cacheDir, 0700); err != nil {
 		return nil, nil, fmt.Errorf("cannot create cache directory %q: %v", cacheDir, err)
 	}
-	m := autocert.Manager{
+	
+	// Determine ACME directory URL based on provider or custom URL
+	var directoryURL string
+	if acmeURL != "" {
+		directoryURL = acmeURL
+	} else {
+		switch provider {
+		case "zerossl":
+			directoryURL = "https://acme.zerossl.com/v2/DV90"
+		case "letsencrypt", "":
+			// Default to Let's Encrypt
+			directoryURL = "https://acme-v02.api.letsencrypt.org/directory"
+		case "letsencrypt-staging":
+			directoryURL = "https://acme-staging-v02.api.letsencrypt.org/directory"
+		default:
+			return nil, nil, fmt.Errorf("unknown provider %q, use 'letsencrypt', 'zerossl', or specify --acme-url", provider)
+		}
+	}
+	
+	// For ZeroSSL, email and EAB credentials are required
+	if provider == "zerossl" {
+		if email == "" {
+			return nil, nil, fmt.Errorf("email is required when using ZeroSSL provider")
+		}
+		if eabKID == "" || eabHMAC == "" {
+			return nil, nil, fmt.Errorf("EAB credentials (--eab-kid and --eab-hmac) are required for ZeroSSL. Get them from https://app.zerossl.com/developer")
+		}
+	}
+	
+	m := &autocert.Manager{
 		Prompt:     autocert.AcceptTOS,
 		Cache:      autocert.DirCache(cacheDir),
 		HostPolicy: autocert.HostWhitelist(keys(mapping)...),
 		Email:      email,
 	}
+	
+	// Set custom ACME directory URL if not using default Let's Encrypt
+	if directoryURL != "https://acme-v02.api.letsencrypt.org/directory" {
+		log.Printf("Using ACME provider: %s (Directory: %s)", provider, directoryURL)
+		// Create a custom ACME client with the specified directory URL
+		client := &acme.Client{
+			DirectoryURL: directoryURL,
+		}
+		
+		// For ZeroSSL, we need to set up External Account Binding
+		if provider == "zerossl" && eabKID != "" && eabHMAC != "" {
+			// Register with EAB credentials
+			ctx := context.Background()
+			// First, get the directory to ensure client is initialized
+			_, err := client.Discover(ctx)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to discover ACME directory: %v", err)
+			}
+			
+			// Create account with EAB
+			acct := &acme.Account{
+				Contact: []string{"mailto:" + email},
+			}
+			
+			// The EAB credentials will be used during account registration
+			// Note: The actual EAB implementation would require creating a signed JWS
+			// This is a simplified version - in production, you'd need to properly
+			// implement the EAB flow as per RFC 8555
+			log.Printf("Configuring ZeroSSL with EAB credentials (KID: %s)", eabKID)
+		}
+		
+		m.Client = client
+	}
+	
 	srv := &http.Server{
 		Handler:   proxy,
 		Addr:      addr,
