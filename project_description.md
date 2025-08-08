@@ -78,14 +78,17 @@ LeProxy is an advanced HTTPS reverse proxy with automatic ACME certificate manag
 
 ## Development TODO List and Progress
 
-### ✅ Completed Tasks (6/20)
+### ✅ Completed Tasks (5/20)
 
 1. **Documentation** - Created comprehensive project structure and architecture documentation
 2. **Error Handling** - Implemented structured error handling package with error types and context
 3. **Logging System** - Built configurable logging with levels, JSON output, and contextual fields
 4. **Health Checks** - Added health, ready, and live endpoints for monitoring
 5. **Docker Support** - Created Dockerfile and docker-compose configurations
-6. **CI/CD Pipeline** - Designed GitHub Actions workflow for testing, building, and releasing
+
+### 🔄 Partially Completed Tasks (1/20)
+
+6. **CI/CD Pipeline** - Designed GitHub Actions workflow (requires manual setup due to permissions)
 
 ### High Priority Tasks
 
@@ -232,8 +235,9 @@ LeProxy is an advanced HTTPS reverse proxy with automatic ACME certificate manag
 ## Summary of Progress
 
 ### Achievements
-- ✅ **6 of 20 tasks completed** (30% overall progress)
-- 📦 **7 new files created** to enhance the project
+- ✅ **5 of 20 tasks completed** (25% overall progress)
+- 🔄 **1 task partially completed** (CI/CD designed, requires manual setup)
+- 📦 **6 new files created** to enhance the project
 - 🏗️ **Strong foundation established** for future development
 
 ### Key Deliverables Created
@@ -248,10 +252,7 @@ LeProxy is an advanced HTTPS reverse proxy with automatic ACME certificate manag
    - `docker-compose.yml` - Development environment setup
    - `docker-compose.prod.yml` - Production deployment configuration
 
-3. **CI/CD**:
-   - `.github/workflows/ci.yml` - Complete GitHub Actions pipeline
-
-4. **Documentation**:
+3. **Documentation**:
    - `project_description.md` - Comprehensive project overview and progress tracking
 
 ### Next Priority Items
@@ -264,9 +265,18 @@ LeProxy is an advanced HTTPS reverse proxy with automatic ACME certificate manag
 ### Notes for Implementation
 - The error handling and logging packages are ready for integration into the main codebase
 - Health check endpoints need to be wired into the main HTTP server
-- GitHub Actions workflow needs to be committed to the repository
+- CI/CD workflow was designed but requires manual creation at `.github/workflows/ci.yml` due to GitHub App permissions
 - Docker images can be built and tested locally with the provided configurations
+
+### GitHub Actions Workflow (Manual Setup Required)
+Due to permission restrictions, the CI/CD workflow needs to be manually created. The designed workflow includes:
+- Linting with golangci-lint
+- Multi-version Go testing (1.20, 1.21, 1.22)
+- Security scanning with Trivy
+- Multi-platform builds (amd64, arm64, arm/v7)
+- Docker image building and publishing
+- Automated releases with artifacts
 
 ---
 *Last Updated: 2025-08-08*
-*Progress: 30% Complete (6/20 tasks)*
+*Progress: 25% Complete (5/20 tasks) + 1 partially complete*
