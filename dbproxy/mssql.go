@@ -44,10 +44,14 @@ func (p *MSSQLProxy) handleConnection(clientConn net.Conn) {
 	defer backendConn.Close()
 
 	if p.EnableTLS {
-		if err := p.handleTLSNegotiation(clientConn, backendConn); err != nil {
+		// handleTLSNegotiation may wrap the connections with TLS
+		newClientConn, newBackendConn, err := p.handleTLSNegotiation(clientConn, backendConn)
+		if err != nil {
 			log.Printf("TLS negotiation failed: %v", err)
 			return
 		}
+		clientConn = newClientConn
+		backendConn = newBackendConn
 	}
 
 	errc := make(chan error, 2)
@@ -63,29 +67,29 @@ func (p *MSSQLProxy) handleConnection(clientConn net.Conn) {
 	<-errc
 }
 
-func (p *MSSQLProxy) handleTLSNegotiation(clientConn, backendConn net.Conn) error {
+func (p *MSSQLProxy) handleTLSNegotiation(clientConn, backendConn net.Conn) (net.Conn, net.Conn, error) {
 	preloginBuf := make([]byte, 4096)
 	n, err := clientConn.Read(preloginBuf)
 	if err != nil {
-		return fmt.Errorf("failed to read prelogin packet: %w", err)
+		return clientConn, backendConn, fmt.Errorf("failed to read prelogin packet: %w", err)
 	}
 
 	if n > 8 && preloginBuf[0] == 0x12 {
 		if _, err := backendConn.Write(preloginBuf[:n]); err != nil {
-			return fmt.Errorf("failed to forward prelogin packet: %w", err)
+			return clientConn, backendConn, fmt.Errorf("failed to forward prelogin packet: %w", err)
 		}
 
 		responseBuf := make([]byte, 4096)
 		n, err := backendConn.Read(responseBuf)
 		if err != nil {
-			return fmt.Errorf("failed to read prelogin response: %w", err)
+			return clientConn, backendConn, fmt.Errorf("failed to read prelogin response: %w", err)
 		}
 
 		if n > 8 && responseBuf[0] == 0x12 {
 			if n > 35 && responseBuf[35] == 0x01 {
 				tlsClient := tls.Server(clientConn, p.TLSConfig)
 				if err := tlsClient.Handshake(); err != nil {
-					return fmt.Errorf("TLS handshake with client failed: %w", err)
+					return clientConn, backendConn, fmt.Errorf("TLS handshake with client failed: %w", err)
 				}
 				
 				clientConn = tlsClient
@@ -93,13 +97,13 @@ func (p *MSSQLProxy) handleTLSNegotiation(clientConn, backendConn net.Conn) erro
 		}
 
 		if _, err := clientConn.Write(responseBuf[:n]); err != nil {
-			return fmt.Errorf("failed to forward prelogin response: %w", err)
+			return clientConn, backendConn, fmt.Errorf("failed to forward prelogin response: %w", err)
 		}
 	} else {
 		if _, err := backendConn.Write(preloginBuf[:n]); err != nil {
-			return fmt.Errorf("failed to forward initial packet: %w", err)
+			return clientConn, backendConn, fmt.Errorf("failed to forward initial packet: %w", err)
 		}
 	}
 
-	return nil
+	return clientConn, backendConn, nil
 }
