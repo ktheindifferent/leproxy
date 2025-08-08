@@ -26,51 +26,65 @@ import (
 	"golang.org/x/crypto/acme/autocert"
 )
 
+// main initializes the application with default configuration values and starts the proxy server
 func main() {
+	// Initialize default configuration for the reverse proxy
 	args := runArgs{
-		Addr:     ":https",
-		HTTP:     ":http",
-		Conf:     "mapping.yml",
-		Cache:    "/var/cache/letsencrypt",
-		RTo:      time.Minute,
-		WTo:      5 * time.Minute,
-		Provider: "letsencrypt",
+		Addr:     ":https",                   // Default HTTPS listen address
+		HTTP:     ":http",                    // Default HTTP listen address for redirects and ACME challenges
+		Conf:     "mapping.yml",               // Default host-to-backend mapping file
+		Cache:    "/var/cache/letsencrypt",   // Default directory for caching certificates
+		RTo:      time.Minute,                 // Default read timeout
+		WTo:      5 * time.Minute,             // Default write timeout
+		Provider: "letsencrypt",               // Default ACME provider
 	}
+	// Parse command-line flags to override defaults
 	autoflags.Parse(&args)
+	// Start the proxy server with the configured arguments
 	if err := run(args); err != nil {
 		log.Fatal(err)
 	}
 }
 
+// runArgs holds all configuration parameters for the proxy server
 type runArgs struct {
-	Addr     string `flag:"addr,address to listen at"`
-	Conf     string `flag:"map,file with host/backend mapping"`
-	Cache    string `flag:"cacheDir,path to directory to cache key and certificates"`
-	HSTS     bool   `flag:"hsts,add Strict-Transport-Security header"`
-	Email    string `flag:"email,contact email address presented to letsencrypt CA"`
-	HTTP     string `flag:"http,optional address to serve http-to-https redirects and ACME http-01 challenge responses"`
-	Provider string `flag:"provider,ACME provider to use (letsencrypt or zerossl, default: letsencrypt)"`
-	ACMEURL  string `flag:"acme-url,custom ACME directory URL (overrides provider)"`
-	EABKID   string `flag:"eab-kid,EAB Key ID for ZeroSSL (required for ZeroSSL)"`
-	EABHMAC  string `flag:"eab-hmac,EAB HMAC key for ZeroSSL (required for ZeroSSL)"`
+	// Core proxy configuration
+	Addr     string `flag:"addr,address to listen at"`                            // HTTPS listen address
+	Conf     string `flag:"map,file with host/backend mapping"`                    // Path to YAML mapping configuration
+	Cache    string `flag:"cacheDir,path to directory to cache key and certificates"` // Certificate cache directory
+	HSTS     bool   `flag:"hsts,add Strict-Transport-Security header"`            // Enable HSTS header for enhanced security
+	Email    string `flag:"email,contact email address presented to letsencrypt CA"` // Contact email for ACME registration
+	HTTP     string `flag:"http,optional address to serve http-to-https redirects and ACME http-01 challenge responses"` // HTTP redirect address
+	
+	// ACME provider configuration
+	Provider string `flag:"provider,ACME provider to use (letsencrypt or zerossl, default: letsencrypt)"` // ACME provider selection
+	ACMEURL  string `flag:"acme-url,custom ACME directory URL (overrides provider)"` // Custom ACME server URL
+	EABKID   string `flag:"eab-kid,EAB Key ID for ZeroSSL (required for ZeroSSL)"`  // External Account Binding Key ID
+	EABHMAC  string `flag:"eab-hmac,EAB HMAC key for ZeroSSL (required for ZeroSSL)"` // External Account Binding HMAC key
 
-	RTo  time.Duration `flag:"rto,maximum duration before timing out read of the request"`
-	WTo  time.Duration `flag:"wto,maximum duration before timing out write of the response"`
-	Idle time.Duration `flag:"idle,how long idle connection is kept before closing (set rto, wto to 0 to use this)"`
+	// Connection timeout configuration
+	RTo  time.Duration `flag:"rto,maximum duration before timing out read of the request"`   // Read timeout
+	WTo  time.Duration `flag:"wto,maximum duration before timing out write of the response"` // Write timeout
+	Idle time.Duration `flag:"idle,how long idle connection is kept before closing (set rto, wto to 0 to use this)"` // Idle connection timeout
 
-	DBConf string `flag:"dbmap,file with database proxy mapping (host:port:type:backend)"`
-	DBCertCache string `flag:"dbcerts,path to directory to cache database certificates"`
+	// Database proxy configuration
+	DBConf string `flag:"dbmap,file with database proxy mapping (host:port:type:backend)"` // Database proxy mapping file
+	DBCertCache string `flag:"dbcerts,path to directory to cache database certificates"`    // Database certificate cache directory
 }
 
+// run initializes and starts the proxy server with the provided configuration
 func run(args runArgs) error {
+	// Validate required configuration
 	if args.Cache == "" {
 		return fmt.Errorf("no cache specified")
 	}
 
-	
-	// Start database proxies if configured
+	// Start database and service proxies if configured
+	// This enables TLS proxy support for databases (PostgreSQL, MySQL, MongoDB, Redis, etc.)
+	// and other services (LDAP, SMTP, FTP, Elasticsearch, Kafka, etc.)
 	if args.DBConf != "" {
 		if err := startDatabaseProxies(args.DBConf, args.DBCertCache); err != nil {
+			// Log warning but continue - main HTTPS proxy can still function
 			log.Printf("Warning: failed to start database proxies: %v", err)
 		}
 	}
