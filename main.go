@@ -459,6 +459,38 @@ func startSingleDBProxy(config dbProxyConfig, certManager *dbproxy.CertManager) 
 		proxy := dbproxy.NewMongoDBProxy(config.Backend, tlsConfig)
 		log.Printf("Starting MongoDB proxy on %s -> %s (TLS: %v)", config.ListenAddr, config.Backend, config.EnableTLS)
 		return proxy.Serve(listener)
+	case "ldap", "ldaps":
+		proxy := dbproxy.NewLDAPProxy(config.Backend, tlsConfig)
+		log.Printf("Starting LDAP proxy on %s -> %s (TLS: %v)", config.ListenAddr, config.Backend, config.EnableTLS)
+		return proxy.Serve(listener)
+	case "smtp", "smtps":
+		proxy := dbproxy.NewSMTPProxy(config.Backend, tlsConfig)
+		log.Printf("Starting SMTP proxy on %s -> %s (TLS: %v)", config.ListenAddr, config.Backend, config.EnableTLS)
+		return proxy.Serve(listener)
+	case "ftp", "ftps":
+		proxy := dbproxy.NewFTPProxy(config.Backend, tlsConfig)
+		log.Printf("Starting FTP proxy on %s -> %s (TLS: %v)", config.ListenAddr, config.Backend, config.EnableTLS)
+		return proxy.Serve(listener)
+	case "elasticsearch", "elastic", "es":
+		proxy := dbproxy.NewElasticsearchProxy(config.Backend, tlsConfig)
+		log.Printf("Starting Elasticsearch proxy on %s -> %s (TLS: %v)", config.ListenAddr, config.Backend, config.EnableTLS)
+		return proxy.Serve(listener)
+	case "amqp", "rabbitmq", "rabbit":
+		proxy := dbproxy.NewAMQPProxy(config.Backend, tlsConfig)
+		log.Printf("Starting AMQP/RabbitMQ proxy on %s -> %s (TLS: %v)", config.ListenAddr, config.Backend, config.EnableTLS)
+		return proxy.Serve(listener)
+	case "kafka":
+		proxy := dbproxy.NewKafkaProxy(config.Backend, tlsConfig)
+		log.Printf("Starting Kafka proxy on %s -> %s (TLS: %v)", config.ListenAddr, config.Backend, config.EnableTLS)
+		return proxy.Serve(listener)
+	case "cassandra", "cql":
+		proxy := dbproxy.NewCassandraProxy(config.Backend, tlsConfig)
+		log.Printf("Starting Cassandra proxy on %s -> %s (TLS: %v)", config.ListenAddr, config.Backend, config.EnableTLS)
+		return proxy.Serve(listener)
+	case "memcached", "memcache":
+		proxy := dbproxy.NewMemcachedProxy(config.Backend, tlsConfig)
+		log.Printf("Starting Memcached proxy on %s -> %s (TLS: %v)", config.ListenAddr, config.Backend, config.EnableTLS)
+		return proxy.Serve(listener)
 	default:
 		return fmt.Errorf("unsupported proxy type: %s", config.ProxyType)
 	}

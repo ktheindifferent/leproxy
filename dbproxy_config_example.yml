@@ -1,0 +1,36 @@
+# Example configuration file for database/service proxies with TLS support
+# Format: host:port:type:backend_host:backend_port[:tls]
+
+# Database proxies (existing)
+0.0.0.0:1433:mssql:internal-mssql.example.com:1433:tls
+0.0.0.0:5432:postgres:internal-postgres.example.com:5432:tls
+0.0.0.0:3306:mysql:internal-mysql.example.com:3306:tls
+0.0.0.0:6379:redis:internal-redis.example.com:6379:tls
+0.0.0.0:27017:mongodb:internal-mongodb.example.com:27017:tls
+
+# New service proxies
+# LDAP/LDAPS - Directory services
+0.0.0.0:636:ldap:internal-ldap.example.com:389:tls
+
+# SMTP/SMTPS - Email server
+0.0.0.0:465:smtp:internal-smtp.example.com:25:tls
+0.0.0.0:587:smtp:internal-smtp.example.com:25:tls
+
+# FTP/FTPS - File transfer
+0.0.0.0:990:ftp:internal-ftp.example.com:21:tls
+0.0.0.0:21:ftp:internal-ftp.example.com:21:tls
+
+# Elasticsearch - Search and analytics
+0.0.0.0:9200:elasticsearch:internal-elastic.example.com:9200:tls
+
+# RabbitMQ/AMQP - Message queue
+0.0.0.0:5671:amqp:internal-rabbitmq.example.com:5672:tls
+
+# Kafka - Event streaming
+0.0.0.0:9093:kafka:internal-kafka.example.com:9092:tls
+
+# Cassandra - NoSQL database
+0.0.0.0:9042:cassandra:internal-cassandra.example.com:9042:tls
+
+# Memcached - Caching
+0.0.0.0:11211:memcached:internal-memcached.example.com:11211:tls
