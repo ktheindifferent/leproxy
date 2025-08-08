@@ -239,6 +239,12 @@ LeProxy is an advanced HTTPS reverse proxy with automatic ACME certificate manag
 - Modularized and clarified server and dbproxy code
 - Added extensive tests for dbproxy components and edge cases
 - Improved admin and leproxy configuration utilities
+- **Refactored codebase for improved readability and maintainability**:
+  - Extracted methods to reduce complexity
+  - Eliminated code duplication through helper functions and generics
+  - Improved variable and function naming for clarity
+  - Simplified conditional logic and nested structures
+  - Created modular, testable functions throughout
 
 ## Next Steps
 

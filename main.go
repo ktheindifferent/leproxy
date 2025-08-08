@@ -74,34 +74,47 @@ type runArgs struct {
 
 // run initializes and starts the proxy server with the provided configuration
 func run(args runArgs) error {
-	// Validate required configuration
-	if args.Cache == "" {
-		return fmt.Errorf("no cache specified")
+	if err := validateConfig(args); err != nil {
+		return err
 	}
 
-	// Start database and service proxies if configured
-	// This enables TLS proxy support for databases (PostgreSQL, MySQL, MongoDB, Redis, etc.)
-	// and other services (LDAP, SMTP, FTP, Elasticsearch, Kafka, etc.)
-	if args.DBConf != "" {
-		if err := startDatabaseProxies(args.DBConf, args.DBCertCache); err != nil {
-			// Log warning but continue - main HTTPS proxy can still function
-			log.Printf("Warning: failed to start database proxies: %v", err)
-		}
+	if err := initializeDatabaseProxies(args); err != nil {
+		log.Printf("Warning: failed to start database proxies: %v", err)
 	}
+
 	srv, httpHandler, err := setupServer(args.Addr, args.Conf, args.Cache, args.Email, args.HSTS, args.Provider, args.ACMEURL, args.EABKID, args.EABHMAC)
-
 	if err != nil {
 		return err
 	}
+
 	configureServerTimeouts(srv, args)
-	
-	if args.HTTP != "" {
-		if err := startHTTPRedirectServer(args.HTTP, httpHandler); err != nil {
-			return err
-		}
+
+	if err := startRedirectServerIfNeeded(args.HTTP, httpHandler); err != nil {
+		return err
 	}
-	
+
 	return startHTTPSServer(srv, args.Idle)
+}
+
+func validateConfig(args runArgs) error {
+	if args.Cache == "" {
+		return fmt.Errorf("no cache specified")
+	}
+	return nil
+}
+
+func initializeDatabaseProxies(args runArgs) error {
+	if args.DBConf == "" {
+		return nil
+	}
+	return startDatabaseProxies(args.DBConf, args.DBCertCache)
+}
+
+func startRedirectServerIfNeeded(httpAddr string, handler http.Handler) error {
+	if httpAddr == "" {
+		return nil
+	}
+	return startHTTPRedirectServer(httpAddr, handler)
 }
 
 func configureServerTimeouts(srv *http.Server, args runArgs) {
@@ -187,30 +200,32 @@ func setupServer(addr, mapfile, cacheDir, email string, hsts bool, provider, acm
 	if err != nil {
 		return nil, nil, err
 	}
-	
+
 	proxy, err := createProxy(mapping, hsts)
 	if err != nil {
 		return nil, nil, err
 	}
-	
+
 	if err := ensureCacheDirectory(cacheDir); err != nil {
 		return nil, nil, err
 	}
-	
+
 	acmeConfig, err := configureACME(provider, acmeURL, email, eabKID, eabHMAC)
 	if err != nil {
 		return nil, nil, err
 	}
-	
-	m := createAutocertManager(cacheDir, email, mapping, acmeConfig)
-	
-	srv := &http.Server{
-		Handler:   proxy,
+
+	certManager := createAutocertManager(cacheDir, email, mapping, acmeConfig)
+
+	return createHTTPSServer(addr, proxy, certManager), certManager.HTTPHandler(nil), nil
+}
+
+func createHTTPSServer(addr string, handler http.Handler, certManager *autocert.Manager) *http.Server {
+	return &http.Server{
+		Handler:   handler,
 		Addr:      addr,
-		TLSConfig: m.TLSConfig(),
+		TLSConfig: certManager.TLSConfig(),
 	}
-	
-	return srv, m.HTTPHandler(nil), nil
 }
 
 func createProxy(mapping map[string]string, hsts bool) (http.Handler, error) {
@@ -327,38 +342,58 @@ func configureZeroSSLClient(client *acme.Client, email, eabKID, eabHMAC string) 
 }
 
 func setProxy(mapping map[string]string) (http.Handler, error) {
-	if len(mapping) == 0 {
-		return nil, fmt.Errorf("empty mapping")
+	if err := validateMapping(mapping); err != nil {
+		return nil, err
 	}
-	
+
+	return buildProxyMux(mapping)
+}
+
+func validateMapping(mapping map[string]string) error {
+	if len(mapping) == 0 {
+		return fmt.Errorf("empty mapping")
+	}
+	return nil
+}
+
+func buildProxyMux(mapping map[string]string) (http.Handler, error) {
 	mux := http.NewServeMux()
-	
+
 	for hostname, backendAddr := range mapping {
 		if err := addProxyHandler(mux, hostname, backendAddr); err != nil {
 			return nil, err
 		}
 	}
-	
+
 	return mux, nil
 }
 
 func addProxyHandler(mux *http.ServeMux, hostname, backendAddr string) error {
+	if err := validateHostname(hostname); err != nil {
+		return err
+	}
+
+	handler := createBackendHandler(hostname, backendAddr)
+	mux.Handle(hostname+"/", handler)
+	return nil
+}
+
+func validateHostname(hostname string) error {
 	if strings.ContainsRune(hostname, os.PathSeparator) {
 		return fmt.Errorf("invalid hostname: %q", hostname)
 	}
-	
-	if isStaticDirectory(backendAddr) {
-		mux.Handle(hostname+"/", http.FileServer(http.Dir(backendAddr)))
-		return nil
-	}
-	
-	if isHTTPBackend(backendAddr) {
-		addHTTPProxy(mux, hostname, backendAddr)
-		return nil
-	}
-	
-	addTCPProxy(mux, hostname, backendAddr)
 	return nil
+}
+
+func createBackendHandler(hostname, backendAddr string) http.Handler {
+	switch {
+	case isStaticDirectory(backendAddr):
+		return http.FileServer(http.Dir(backendAddr))
+	case isHTTPBackend(backendAddr):
+		return createHTTPProxyHandler(backendAddr)
+	default:
+		return createTCPProxyHandler(backendAddr)
+	}
 }
 
 func isStaticDirectory(addr string) bool {
@@ -373,25 +408,23 @@ func isHTTPBackend(addr string) bool {
 	return u.Scheme == "http" || u.Scheme == "https"
 }
 
-func addHTTPProxy(mux *http.ServeMux, hostname, backendAddr string) {
+func createHTTPProxyHandler(backendAddr string) http.Handler {
 	u, _ := url.Parse(backendAddr)
 	rp := newSingleHostReverseProxy(u)
 	rp.ErrorLog = log.New(io.Discard, "", 0)
 	rp.BufferPool = bufPool{}
-	mux.Handle(hostname+"/", rp)
+	return rp
 }
 
-func addTCPProxy(mux *http.ServeMux, hostname, backendAddr string) {
+func createTCPProxyHandler(backendAddr string) http.Handler {
 	network, address := determineNetworkType(backendAddr)
-	
-	rp := &httputil.ReverseProxy{
+
+	return &httputil.ReverseProxy{
 		Director:   createDirector(),
 		Transport:  createTransport(network, address),
 		ErrorLog:   log.New(io.Discard, "", 0),
 		BufferPool: bufPool{},
 	}
-	
-	mux.Handle(hostname+"/", rp)
 }
 
 func determineNetworkType(backendAddr string) (string, string) {
@@ -428,19 +461,42 @@ func readMapping(file string) (map[string]string, error) {
 		return nil, err
 	}
 	defer f.Close()
-	m := make(map[string]string)
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		if b := sc.Bytes(); len(b) == 0 || b[0] == '#' {
+
+	return parseMappingFile(bufio.NewScanner(f))
+}
+
+func parseMappingFile(scanner *bufio.Scanner) (map[string]string, error) {
+	mappings := make(map[string]string)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if shouldSkipMappingLine(line) {
 			continue
 		}
-		s := strings.SplitN(sc.Text(), ":", 2)
-		if len(s) != 2 {
-			return nil, fmt.Errorf("invalid line: %q", sc.Text())
+
+		key, value, err := parseMappingLine(line)
+		if err != nil {
+			return nil, err
 		}
-		m[strings.TrimSpace(s[0])] = strings.TrimSpace(s[1])
+
+		mappings[key] = value
 	}
-	return m, sc.Err()
+
+	return mappings, scanner.Err()
+}
+
+func shouldSkipMappingLine(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	return len(trimmed) == 0 || trimmed[0] == '#'
+}
+
+func parseMappingLine(line string) (string, string, error) {
+	parts := strings.SplitN(line, ":", 2)
+	if len(parts) != 2 {
+		return "", "", fmt.Errorf("invalid line: %q", line)
+	}
+
+	return strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]), nil
 }
 
 func keys(m map[string]string) []string {
@@ -500,12 +556,13 @@ func newSingleHostReverseProxy(target *url.URL) *httputil.ReverseProxy {
 }
 
 func singleJoiningSlash(a, b string) string {
-	aslash := strings.HasSuffix(a, "/")
-	bslash := strings.HasPrefix(b, "/")
-	switch {
-	case aslash && bslash:
+	aEndsWithSlash := strings.HasSuffix(a, "/")
+	bStartsWithSlash := strings.HasPrefix(b, "/")
+	
+	if aEndsWithSlash && bStartsWithSlash {
 		return a + b[1:]
-	case !aslash && !bslash:
+	}
+	if !aEndsWithSlash && !bStartsWithSlash {
 		return a + "/" + b
 	}
 	return a + b
@@ -572,49 +629,69 @@ func startDatabaseProxies(configFile, certCacheDir string) error {
 		return fmt.Errorf("failed to read database proxy config: %w", err)
 	}
 
-	if certCacheDir == "" {
-		certCacheDir = "/var/cache/dbproxy-certs"
-	}
-	certManager := dbproxy.NewCertManager(certCacheDir)
-
-	for _, config := range configs {
-		go func(cfg dbProxyConfig) {
-			if err := startSingleDBProxy(cfg, certManager); err != nil {
-				log.Printf("Failed to start %s proxy on %s: %v", cfg.ProxyType, cfg.ListenAddr, err)
-			}
-		}(config)
-	}
+	certManager := createCertManager(certCacheDir)
+	startProxyWorkers(configs, certManager)
 
 	return nil
 }
 
+func createCertManager(certCacheDir string) *dbproxy.CertManager {
+	if certCacheDir == "" {
+		certCacheDir = "/var/cache/dbproxy-certs"
+	}
+	return dbproxy.NewCertManager(certCacheDir)
+}
+
+func startProxyWorkers(configs []dbProxyConfig, certManager *dbproxy.CertManager) {
+	for _, config := range configs {
+		go startProxyWorker(config, certManager)
+	}
+}
+
+func startProxyWorker(cfg dbProxyConfig, certManager *dbproxy.CertManager) {
+	if err := startSingleDBProxy(cfg, certManager); err != nil {
+		log.Printf("Failed to start %s proxy on %s: %v", cfg.ProxyType, cfg.ListenAddr, err)
+	}
+}
+
 type proxyFactory func(string, *tls.Config) interface{ Serve(net.Listener) error }
 
-var proxyFactories = map[string]proxyFactory{
-	"mssql":         func(b string, t *tls.Config) interface{ Serve(net.Listener) error } { return dbproxy.NewMSSQLProxy(b, t) },
-	"postgres":      func(b string, t *tls.Config) interface{ Serve(net.Listener) error } { return dbproxy.NewPostgresProxy(b, t) },
-	"postgresql":    func(b string, t *tls.Config) interface{ Serve(net.Listener) error } { return dbproxy.NewPostgresProxy(b, t) },
-	"mysql":         func(b string, t *tls.Config) interface{ Serve(net.Listener) error } { return dbproxy.NewMySQLProxy(b, t) },
-	"redis":         func(b string, t *tls.Config) interface{ Serve(net.Listener) error } { return dbproxy.NewRedisProxy(b, t) },
-	"mongodb":       func(b string, t *tls.Config) interface{ Serve(net.Listener) error } { return dbproxy.NewMongoDBProxy(b, t) },
-	"mongo":         func(b string, t *tls.Config) interface{ Serve(net.Listener) error } { return dbproxy.NewMongoDBProxy(b, t) },
-	"ldap":          func(b string, t *tls.Config) interface{ Serve(net.Listener) error } { return dbproxy.NewLDAPProxy(b, t) },
-	"ldaps":         func(b string, t *tls.Config) interface{ Serve(net.Listener) error } { return dbproxy.NewLDAPProxy(b, t) },
-	"smtp":          func(b string, t *tls.Config) interface{ Serve(net.Listener) error } { return dbproxy.NewSMTPProxy(b, t) },
-	"smtps":         func(b string, t *tls.Config) interface{ Serve(net.Listener) error } { return dbproxy.NewSMTPProxy(b, t) },
-	"ftp":           func(b string, t *tls.Config) interface{ Serve(net.Listener) error } { return dbproxy.NewFTPProxy(b, t) },
-	"ftps":          func(b string, t *tls.Config) interface{ Serve(net.Listener) error } { return dbproxy.NewFTPProxy(b, t) },
-	"elasticsearch": func(b string, t *tls.Config) interface{ Serve(net.Listener) error } { return dbproxy.NewElasticsearchProxy(b, t) },
-	"elastic":       func(b string, t *tls.Config) interface{ Serve(net.Listener) error } { return dbproxy.NewElasticsearchProxy(b, t) },
-	"es":            func(b string, t *tls.Config) interface{ Serve(net.Listener) error } { return dbproxy.NewElasticsearchProxy(b, t) },
-	"amqp":          func(b string, t *tls.Config) interface{ Serve(net.Listener) error } { return dbproxy.NewAMQPProxy(b, t) },
-	"rabbitmq":      func(b string, t *tls.Config) interface{ Serve(net.Listener) error } { return dbproxy.NewAMQPProxy(b, t) },
-	"rabbit":        func(b string, t *tls.Config) interface{ Serve(net.Listener) error } { return dbproxy.NewAMQPProxy(b, t) },
-	"kafka":         func(b string, t *tls.Config) interface{ Serve(net.Listener) error } { return dbproxy.NewKafkaProxy(b, t) },
-	"cassandra":     func(b string, t *tls.Config) interface{ Serve(net.Listener) error } { return dbproxy.NewCassandraProxy(b, t) },
-	"cql":           func(b string, t *tls.Config) interface{ Serve(net.Listener) error } { return dbproxy.NewCassandraProxy(b, t) },
-	"memcached":     func(b string, t *tls.Config) interface{ Serve(net.Listener) error } { return dbproxy.NewMemcachedProxy(b, t) },
-	"memcache":      func(b string, t *tls.Config) interface{ Serve(net.Listener) error } { return dbproxy.NewMemcachedProxy(b, t) },
+var proxyFactories = initProxyFactories()
+
+func initProxyFactories() map[string]proxyFactory {
+	factories := map[string]proxyFactory{
+		"mssql":         createProxy(dbproxy.NewMSSQLProxy),
+		"postgres":      createProxy(dbproxy.NewPostgresProxy),
+		"postgresql":    createProxy(dbproxy.NewPostgresProxy),
+		"mysql":         createProxy(dbproxy.NewMySQLProxy),
+		"redis":         createProxy(dbproxy.NewRedisProxy),
+		"mongodb":       createProxy(dbproxy.NewMongoDBProxy),
+		"mongo":         createProxy(dbproxy.NewMongoDBProxy),
+		"ldap":          createProxy(dbproxy.NewLDAPProxy),
+		"ldaps":         createProxy(dbproxy.NewLDAPProxy),
+		"smtp":          createProxy(dbproxy.NewSMTPProxy),
+		"smtps":         createProxy(dbproxy.NewSMTPProxy),
+		"ftp":           createProxy(dbproxy.NewFTPProxy),
+		"ftps":          createProxy(dbproxy.NewFTPProxy),
+		"elasticsearch": createProxy(dbproxy.NewElasticsearchProxy),
+		"elastic":       createProxy(dbproxy.NewElasticsearchProxy),
+		"es":            createProxy(dbproxy.NewElasticsearchProxy),
+		"amqp":          createProxy(dbproxy.NewAMQPProxy),
+		"rabbitmq":      createProxy(dbproxy.NewAMQPProxy),
+		"rabbit":        createProxy(dbproxy.NewAMQPProxy),
+		"kafka":         createProxy(dbproxy.NewKafkaProxy),
+		"cassandra":     createProxy(dbproxy.NewCassandraProxy),
+		"cql":           createProxy(dbproxy.NewCassandraProxy),
+		"memcached":     createProxy(dbproxy.NewMemcachedProxy),
+		"memcache":      createProxy(dbproxy.NewMemcachedProxy),
+	}
+	return factories
+}
+
+func createProxy[T interface{ Serve(net.Listener) error }](constructor func(string, *tls.Config) T) proxyFactory {
+	return func(backend string, tlsConfig *tls.Config) interface{ Serve(net.Listener) error } {
+		return constructor(backend, tlsConfig)
+	}
 }
 
 func startSingleDBProxy(config dbProxyConfig, certManager *dbproxy.CertManager) error {
@@ -682,35 +759,35 @@ func logProxyStart(config dbProxyConfig) {
 		proxyName, config.ListenAddr, config.Backend, config.EnableTLS)
 }
 
+var proxyDisplayNames = map[string]string{
+	"mssql":         "MSSQL",
+	"postgres":      "Postgres",
+	"postgresql":    "Postgres",
+	"mysql":         "MySQL",
+	"redis":         "Redis",
+	"mongodb":       "MongoDB",
+	"mongo":         "MongoDB",
+	"ldap":          "LDAP",
+	"ldaps":         "LDAP",
+	"smtp":          "SMTP",
+	"smtps":         "SMTP",
+	"ftp":           "FTP",
+	"ftps":          "FTP",
+	"elasticsearch": "Elasticsearch",
+	"elastic":       "Elasticsearch",
+	"es":            "Elasticsearch",
+	"amqp":          "AMQP/RabbitMQ",
+	"rabbitmq":      "AMQP/RabbitMQ",
+	"rabbit":        "AMQP/RabbitMQ",
+	"kafka":         "Kafka",
+	"cassandra":     "Cassandra",
+	"cql":           "Cassandra",
+	"memcached":     "Memcached",
+	"memcache":      "Memcached",
+}
+
 func getProxyDisplayName(proxyType string) string {
-	displayNames := map[string]string{
-		"mssql":         "MSSQL",
-		"postgres":      "Postgres",
-		"postgresql":    "Postgres",
-		"mysql":         "MySQL",
-		"redis":         "Redis",
-		"mongodb":       "MongoDB",
-		"mongo":         "MongoDB",
-		"ldap":          "LDAP",
-		"ldaps":         "LDAP",
-		"smtp":          "SMTP",
-		"smtps":         "SMTP",
-		"ftp":           "FTP",
-		"ftps":          "FTP",
-		"elasticsearch": "Elasticsearch",
-		"elastic":       "Elasticsearch",
-		"es":            "Elasticsearch",
-		"amqp":          "AMQP/RabbitMQ",
-		"rabbitmq":      "AMQP/RabbitMQ",
-		"rabbit":        "AMQP/RabbitMQ",
-		"kafka":         "Kafka",
-		"cassandra":     "Cassandra",
-		"cql":           "Cassandra",
-		"memcached":     "Memcached",
-		"memcache":      "Memcached",
-	}
-	
-	if name, ok := displayNames[strings.ToLower(proxyType)]; ok {
+	if name, ok := proxyDisplayNames[strings.ToLower(proxyType)]; ok {
 		return name
 	}
 	return proxyType
@@ -752,14 +829,20 @@ func shouldSkipLine(line string) bool {
 
 func parseDBProxyLine(line string) (dbProxyConfig, error) {
 	parts := strings.Split(line, ":")
+	if err := validateConfigParts(parts, line); err != nil {
+		return dbProxyConfig{}, err
+	}
+	return buildDBProxyConfig(parts), nil
+}
+
+func validateConfigParts(parts []string, line string) error {
 	if len(parts) < 4 {
-		return dbProxyConfig{}, fmt.Errorf(
+		return fmt.Errorf(
 			"invalid database proxy config line: %q (expected format: host:port:type:backend_host:backend_port[:tls])",
 			line,
 		)
 	}
-
-	return buildDBProxyConfig(parts), nil
+	return nil
 }
 
 func buildDBProxyConfig(parts []string) dbProxyConfig {
@@ -768,12 +851,15 @@ func buildDBProxyConfig(parts []string) dbProxyConfig {
 		ProxyType:  parts[2],
 	}
 
+	setBackendConfig(&config, parts)
+	return config
+}
+
+func setBackendConfig(config *dbProxyConfig, parts []string) {
 	if len(parts) >= 5 {
 		config.Backend = net.JoinHostPort(parts[3], parts[4])
 		config.EnableTLS = len(parts) > 5 && strings.ToLower(parts[5]) == "tls"
 	} else {
 		config.Backend = parts[3]
 	}
-
-	return config
 }

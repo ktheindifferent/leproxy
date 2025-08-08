@@ -44,37 +44,40 @@ func (p *PostgresProxy) Serve(listener net.Listener) error {
 func (p *PostgresProxy) handleConnection(clientConn net.Conn) {
 	defer clientConn.Close()
 
-	// Connect to the backend PostgreSQL server
-	backendConn, err := net.DialTimeout("tcp", p.Backend, 10*time.Second)
+	backendConn, err := p.connectToBackend()
 	if err != nil {
 		log.Printf("Failed to connect to Postgres backend %s: %v", p.Backend, err)
 		return
 	}
 	defer backendConn.Close()
 
-	// Handle SSL/TLS negotiation if enabled
 	if p.EnableTLS {
-		// handleSSLNegotiation intercepts the PostgreSQL SSL request and establishes TLS
-		newClientConn, newBackendConn, err := p.handleSSLNegotiation(clientConn, backendConn)
+		clientConn, backendConn, err = p.handleSSLNegotiation(clientConn, backendConn)
 		if err != nil {
 			log.Printf("SSL negotiation failed: %v", err)
 			return
 		}
-		clientConn = newClientConn
-		backendConn = newBackendConn
 	}
 
-	errc := make(chan error, 2)
-	go func() {
-		_, err := io.Copy(backendConn, clientConn)
-		errc <- err
-	}()
-	go func() {
-		_, err := io.Copy(clientConn, backendConn)
-		errc <- err
-	}()
+	p.proxyConnections(clientConn, backendConn)
+}
 
-	<-errc
+func (p *PostgresProxy) connectToBackend() (net.Conn, error) {
+	return net.DialTimeout("tcp", p.Backend, 10*time.Second)
+}
+
+func (p *PostgresProxy) proxyConnections(clientConn, backendConn net.Conn) {
+	errChan := make(chan error, 2)
+	
+	copyData := func(dst, src net.Conn) {
+		_, err := io.Copy(dst, src)
+		errChan <- err
+	}
+	
+	go copyData(backendConn, clientConn)
+	go copyData(clientConn, backendConn)
+	
+	<-errChan
 }
 
 // handleSSLNegotiation manages the PostgreSQL SSL negotiation protocol
@@ -130,20 +133,18 @@ func (p *PostgresProxy) handleSSLNegotiation(clientConn, backendConn net.Conn) (
 	return clientConn, backendConn, nil
 }
 
+const postgresSSLRequestCode = 80877103
+
 func isSSLRequest(buf []byte) bool {
 	if len(buf) < 8 {
 		return false
 	}
-	var length int32
-	if err := binary.Read(bytes.NewReader(buf[:4]), binary.BigEndian, &length); err != nil {
-		return false
-	}
+	
+	length := binary.BigEndian.Uint32(buf[:4])
 	if length != 8 {
 		return false
 	}
-	var code int32
-	if err := binary.Read(bytes.NewReader(buf[4:8]), binary.BigEndian, &code); err != nil {
-		return false
-	}
-	return code == 80877103
+	
+	code := binary.BigEndian.Uint32(buf[4:8])
+	return code == postgresSSLRequestCode
 }
