@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/artyom/autoflags"
+	"github.com/artyom/leproxy/dbproxy"
 	"golang.org/x/crypto/acme/autocert"
 )
 
@@ -48,12 +49,23 @@ type runArgs struct {
 	RTo  time.Duration `flag:"rto,maximum duration before timing out read of the request"`
 	WTo  time.Duration `flag:"wto,maximum duration before timing out write of the response"`
 	Idle time.Duration `flag:"idle,how long idle connection is kept before closing (set rto, wto to 0 to use this)"`
+
+	DBConf string `flag:"dbmap,file with database proxy mapping (host:port:type:backend)"`
+	DBCertCache string `flag:"dbcerts,path to directory to cache database certificates"`
 }
 
 func run(args runArgs) error {
 	if args.Cache == "" {
 		return fmt.Errorf("no cache specified")
 	}
+	
+	// Start database proxies if configured
+	if args.DBConf != "" {
+		if err := startDatabaseProxies(args.DBConf, args.DBCertCache); err != nil {
+			log.Printf("Warning: failed to start database proxies: %v", err)
+		}
+	}
+	
 	srv, httpHandler, err := setupServer(args.Addr, args.Conf, args.Cache, args.Email, args.HSTS)
 	if err != nil {
 		return err
@@ -295,4 +307,108 @@ func (c timeoutConn) Write(b []byte) (int, error) {
 		_ = c.TCPConn.SetDeadline(time.Now().Add(c.d))
 	}
 	return n, err
+}
+
+type dbProxyConfig struct {
+	ListenAddr string
+	ProxyType  string
+	Backend    string
+	EnableTLS  bool
+}
+
+func startDatabaseProxies(configFile, certCacheDir string) error {
+	configs, err := readDBProxyConfig(configFile)
+	if err != nil {
+		return fmt.Errorf("failed to read database proxy config: %w", err)
+	}
+
+	if certCacheDir == "" {
+		certCacheDir = "/var/cache/dbproxy-certs"
+	}
+	certManager := dbproxy.NewCertManager(certCacheDir)
+
+	for _, config := range configs {
+		go func(cfg dbProxyConfig) {
+			if err := startSingleDBProxy(cfg, certManager); err != nil {
+				log.Printf("Failed to start %s proxy on %s: %v", cfg.ProxyType, cfg.ListenAddr, err)
+			}
+		}(config)
+	}
+
+	return nil
+}
+
+func startSingleDBProxy(config dbProxyConfig, certManager *dbproxy.CertManager) error {
+	listener, err := net.Listen("tcp", config.ListenAddr)
+	if err != nil {
+		return fmt.Errorf("failed to listen on %s: %w", config.ListenAddr, err)
+	}
+
+	var tlsConfig *tls.Config
+	if config.EnableTLS {
+		host, _, err := net.SplitHostPort(config.ListenAddr)
+		if err != nil {
+			host = "localhost"
+		}
+		tlsConfig, err = certManager.GetTLSConfig(host)
+		if err != nil {
+			return fmt.Errorf("failed to get TLS config: %w", err)
+		}
+	}
+
+	switch strings.ToLower(config.ProxyType) {
+	case "mssql":
+		proxy := dbproxy.NewMSSQLProxy(config.Backend, tlsConfig)
+		log.Printf("Starting MSSQL proxy on %s -> %s (TLS: %v)", config.ListenAddr, config.Backend, config.EnableTLS)
+		return proxy.Serve(listener)
+	case "postgres", "postgresql":
+		proxy := dbproxy.NewPostgresProxy(config.Backend, tlsConfig)
+		log.Printf("Starting Postgres proxy on %s -> %s (TLS: %v)", config.ListenAddr, config.Backend, config.EnableTLS)
+		return proxy.Serve(listener)
+	default:
+		return fmt.Errorf("unsupported proxy type: %s", config.ProxyType)
+	}
+}
+
+func readDBProxyConfig(file string) ([]dbProxyConfig, error) {
+	f, err := os.Open(file)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var configs []dbProxyConfig
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || line[0] == '#' {
+			continue
+		}
+
+		parts := strings.SplitN(line, ":", 4)
+		if len(parts) < 3 {
+			return nil, fmt.Errorf("invalid database proxy config line: %q (expected format: host:port:type:backend[:tls])", line)
+		}
+
+		config := dbProxyConfig{
+			ListenAddr: net.JoinHostPort(parts[0], parts[1]),
+			ProxyType:  parts[2],
+		}
+
+		if len(parts) >= 4 {
+			backendParts := strings.Split(parts[3], ":")
+			if len(backendParts) >= 2 {
+				config.Backend = net.JoinHostPort(backendParts[0], backendParts[1])
+				if len(backendParts) > 2 && strings.ToLower(backendParts[2]) == "tls" {
+					config.EnableTLS = true
+				}
+			} else {
+				config.Backend = parts[3]
+			}
+		}
+
+		configs = append(configs, config)
+	}
+
+	return configs, sc.Err()
 }
