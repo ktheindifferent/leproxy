@@ -1,0 +1,21 @@
+# Database Proxy Configuration
+# Format: host:port:type:backend_host:backend_port[:tls]
+# 
+# type can be: mssql, postgres, postgresql
+# Add :tls at the end to enable TLS certificate generation for client connections
+#
+# Examples:
+
+# MSSQL proxy with automatic TLS certificate
+0.0.0.0:1433:mssql:internal-mssql.example.com:1433:tls
+
+# Postgres proxy with automatic TLS certificate  
+0.0.0.0:5432:postgres:internal-postgres.example.com:5432:tls
+
+# Multiple database proxies
+0.0.0.0:1433:mssql:10.0.1.50:1433:tls
+0.0.0.0:5432:postgres:10.0.1.51:5432:tls
+0.0.0.0:5433:postgres:10.0.1.52:5432
+
+# Proxy without TLS (plain TCP forwarding)
+0.0.0.0:3306:mysql:internal-mysql.example.com:3306
