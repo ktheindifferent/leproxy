@@ -1,3 +1,4 @@
+// Package dbproxy provides TLS proxy support for various database protocols
 package dbproxy
 
 import (
@@ -11,12 +12,14 @@ import (
 	"time"
 )
 
+// PostgresProxy handles PostgreSQL protocol proxying with optional TLS support
 type PostgresProxy struct {
-	Backend   string
-	TLSConfig *tls.Config
-	EnableTLS bool
+	Backend   string      // Backend PostgreSQL server address (host:port)
+	TLSConfig *tls.Config // TLS configuration for client connections
+	EnableTLS bool        // Whether TLS is enabled for this proxy
 }
 
+// NewPostgresProxy creates a new PostgreSQL proxy instance
 func NewPostgresProxy(backend string, tlsConfig *tls.Config) *PostgresProxy {
 	return &PostgresProxy{
 		Backend:   backend,
@@ -25,19 +28,23 @@ func NewPostgresProxy(backend string, tlsConfig *tls.Config) *PostgresProxy {
 	}
 }
 
+// Serve starts accepting and handling PostgreSQL client connections
 func (p *PostgresProxy) Serve(listener net.Listener) error {
 	for {
 		clientConn, err := listener.Accept()
 		if err != nil {
 			return fmt.Errorf("failed to accept connection: %w", err)
 		}
+		// Handle each connection in a separate goroutine
 		go p.handleConnection(clientConn)
 	}
 }
 
+// handleConnection manages a single client connection to the PostgreSQL backend
 func (p *PostgresProxy) handleConnection(clientConn net.Conn) {
 	defer clientConn.Close()
 
+	// Connect to the backend PostgreSQL server
 	backendConn, err := net.DialTimeout("tcp", p.Backend, 10*time.Second)
 	if err != nil {
 		log.Printf("Failed to connect to Postgres backend %s: %v", p.Backend, err)
@@ -45,8 +52,9 @@ func (p *PostgresProxy) handleConnection(clientConn net.Conn) {
 	}
 	defer backendConn.Close()
 
+	// Handle SSL/TLS negotiation if enabled
 	if p.EnableTLS {
-		// handleSSLNegotiation may wrap the connections with TLS
+		// handleSSLNegotiation intercepts the PostgreSQL SSL request and establishes TLS
 		newClientConn, newBackendConn, err := p.handleSSLNegotiation(clientConn, backendConn)
 		if err != nil {
 			log.Printf("SSL negotiation failed: %v", err)
@@ -69,13 +77,17 @@ func (p *PostgresProxy) handleConnection(clientConn net.Conn) {
 	<-errc
 }
 
+// handleSSLNegotiation manages the PostgreSQL SSL negotiation protocol
+// It intercepts the SSLRequest packet and establishes TLS connections when requested
 func (p *PostgresProxy) handleSSLNegotiation(clientConn, backendConn net.Conn) (net.Conn, net.Conn, error) {
+	// Read the initial packet which might be an SSL request
 	buf := make([]byte, 8)
 	n, err := clientConn.Read(buf)
 	if err != nil {
 		return clientConn, backendConn, fmt.Errorf("failed to read SSL request: %w", err)
 	}
 
+	// Check if this is an SSL request packet (80877103 in network byte order)
 	if n == 8 && isSSLRequest(buf) {
 		if _, err := backendConn.Write(buf); err != nil {
 			return clientConn, backendConn, fmt.Errorf("failed to forward SSL request to backend: %w", err)
