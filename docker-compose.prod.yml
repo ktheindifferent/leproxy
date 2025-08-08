@@ -1,0 +1,56 @@
+version: '3.8'
+
+services:
+  leproxy:
+    image: leproxy:latest
+    container_name: leproxy
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /etc/leproxy/mapping.yml:/etc/leproxy/mapping.yml:ro
+      - /etc/leproxy/dbproxy-mapping.conf:/etc/leproxy/dbproxy-mapping.conf:ro
+      - /var/cache/letsencrypt:/var/cache/letsencrypt
+      - /var/cache/dbproxy-certs:/var/cache/dbproxy-certs
+    environment:
+      - LOG_LEVEL=INFO
+      - LOG_FORMAT=json
+    command:
+      - "-addr=:443"
+      - "-http=:80"
+      - "-map=/etc/leproxy/mapping.yml"
+      - "-cacheDir=/var/cache/letsencrypt"
+      - "-dbmap=/etc/leproxy/dbproxy-mapping.conf"
+      - "-dbcerts=/var/cache/dbproxy-certs"
+      - "-hsts"
+      - "-email=${ACME_EMAIL}"
+      - "-provider=${ACME_PROVIDER:-letsencrypt}"
+      - "-rto=30s"
+      - "-wto=2m"
+      - "-idle=5m"
+    networks:
+      - proxy-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 512M
+        reservations:
+          cpus: '0.5'
+          memory: 128M
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+networks:
+  proxy-network:
+    external: true

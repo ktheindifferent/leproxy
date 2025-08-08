@@ -1,0 +1,84 @@
+version: '3.8'
+
+services:
+  leproxy:
+    build: .
+    container_name: leproxy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      # Database proxy ports (uncomment as needed)
+      # - "5432:5432"  # PostgreSQL
+      # - "3306:3306"  # MySQL
+      # - "27017:27017" # MongoDB
+      # - "6379:6379"  # Redis
+      # - "9042:9042"  # Cassandra
+      # - "1433:1433"  # MSSQL
+      # - "11211:11211" # Memcached
+      # - "389:389"    # LDAP
+      # - "636:636"    # LDAPS
+      # - "25:25"      # SMTP
+      # - "465:465"    # SMTPS
+      # - "21:21"      # FTP
+      # - "990:990"    # FTPS
+      # - "9200:9200"  # Elasticsearch
+      # - "5672:5672"  # RabbitMQ/AMQP
+      # - "9093:9093"  # Kafka
+    volumes:
+      - ./mapping.yml:/etc/leproxy/mapping.yml:ro
+      - ./dbproxy-mapping.conf:/etc/leproxy/dbproxy-mapping.conf:ro
+      - letsencrypt-cache:/var/cache/letsencrypt
+      - dbproxy-certs:/var/cache/dbproxy-certs
+    environment:
+      - LOG_LEVEL=INFO
+      - LOG_FORMAT=json
+    command:
+      - "-addr=:443"
+      - "-http=:80"
+      - "-map=/etc/leproxy/mapping.yml"
+      - "-cacheDir=/var/cache/letsencrypt"
+      - "-dbmap=/etc/leproxy/dbproxy-mapping.conf"
+      - "-dbcerts=/var/cache/dbproxy-certs"
+      - "-hsts"
+    networks:
+      - proxy-network
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Example backend service (remove in production)
+  backend-example:
+    image: nginx:alpine
+    container_name: backend-example
+    networks:
+      - proxy-network
+    volumes:
+      - ./example-content:/usr/share/nginx/html:ro
+
+  # Example PostgreSQL with TLS proxy (remove in production)
+  postgres-example:
+    image: postgres:15-alpine
+    container_name: postgres-example
+    environment:
+      POSTGRES_PASSWORD: example_password
+      POSTGRES_DB: example_db
+    networks:
+      - proxy-network
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+volumes:
+  letsencrypt-cache:
+    driver: local
+  dbproxy-certs:
+    driver: local
+  postgres-data:
+    driver: local
+
+networks:
+  proxy-network:
+    driver: bridge
