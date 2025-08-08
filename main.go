@@ -115,8 +115,12 @@ func run(args runArgs) error {
 		return err
 	}
 	defer ln.Close()
+	tcpLn, ok := ln.(*net.TCPListener)
+	if !ok {
+		return fmt.Errorf("failed to cast listener to TCPListener")
+	}
 	ln = tcpKeepAliveListener{d: args.Idle,
-		TCPListener: ln.(*net.TCPListener)}
+		TCPListener: tcpLn}
 	return srv.ServeTLS(ln, "", "")
 }
 
@@ -305,7 +309,14 @@ func (p *hstsProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 type bufPool struct{}
 
-func (bp bufPool) Get() []byte  { return bufferPool.Get().([]byte) }
+func (bp bufPool) Get() []byte  { 
+	if v := bufferPool.Get(); v != nil {
+		if b, ok := v.([]byte); ok {
+			return b
+		}
+	}
+	return make([]byte, 32*1024)
+}
 func (bp bufPool) Put(b []byte) { bufferPool.Put(b) }
 
 var bufferPool = &sync.Pool{
@@ -378,7 +389,9 @@ type timeoutConn struct {
 func (c timeoutConn) Read(b []byte) (int, error) {
 	n, err := c.TCPConn.Read(b)
 	if err == nil {
-		_ = c.TCPConn.SetDeadline(time.Now().Add(c.d))
+		if deadlineErr := c.TCPConn.SetDeadline(time.Now().Add(c.d)); deadlineErr != nil {
+			log.Printf("Failed to set read deadline: %v", deadlineErr)
+		}
 	}
 	return n, err
 }
@@ -386,7 +399,9 @@ func (c timeoutConn) Read(b []byte) (int, error) {
 func (c timeoutConn) Write(b []byte) (int, error) {
 	n, err := c.TCPConn.Write(b)
 	if err == nil {
-		_ = c.TCPConn.SetDeadline(time.Now().Add(c.d))
+		if deadlineErr := c.TCPConn.SetDeadline(time.Now().Add(c.d)); deadlineErr != nil {
+			log.Printf("Failed to set write deadline: %v", deadlineErr)
+		}
 	}
 	return n, err
 }
@@ -507,7 +522,7 @@ func readDBProxyConfig(file string) ([]dbProxyConfig, error) {
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
-		if line == "" || line[0] == '#' {
+		if len(line) == 0 || line[0] == '#' {
 			continue
 		}
 
