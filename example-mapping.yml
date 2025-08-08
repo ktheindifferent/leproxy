@@ -1,0 +1,17 @@
+# Example mapping configuration for leproxy
+# Format: hostname: backend
+
+# HTTP backend on localhost
+api.example.com: 127.0.0.1:8080
+
+# HTTPS backend 
+secure.example.com: https://backend.internal.com
+
+# Unix socket
+app.example.com: /var/run/app.sock
+
+# Static file serving (note the trailing slash)
+static.example.com: /var/www/static/
+
+# Abstract unix socket (Linux only)
+# special.example.com: @myapp
