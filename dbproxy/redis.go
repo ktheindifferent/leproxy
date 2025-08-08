@@ -95,16 +95,22 @@ func (p *RedisProxy) handleConnection(clientConn net.Conn) {
 
 		// For connections that used a reader, we need to handle buffered data
 		if clientReader != nil {
-			go p.proxyWithReader(clientReader, clientConn, backendConn)
+			errCh := make(chan error, 2)
+			go func() {
+				err := p.proxyWithReader(clientReader, clientConn, backendConn)
+				errCh <- err
+			}()
 			go func() {
 				_, err := io.Copy(clientConn, backendConn)
 				if err != nil && err != io.EOF {
 					log.Printf("Error copying from backend to client: %v", err)
 				}
+				errCh <- err
 			}()
 			
-			// Wait for connection to close
-			select {}
+			// Wait for either direction to finish
+			<-errCh
+			return
 		}
 	}
 
@@ -131,12 +137,14 @@ func (p *RedisProxy) isStartTLSCommand(data []byte) bool {
 	return strings.Contains(strings.ToUpper(str), "STARTTLS")
 }
 
-func (p *RedisProxy) proxyWithReader(reader *bufio.Reader, client, backend net.Conn) {
+func (p *RedisProxy) proxyWithReader(reader *bufio.Reader, client, backend net.Conn) error {
 	// First, flush any buffered data
 	if reader.Buffered() > 0 {
 		buffered, err := reader.Peek(reader.Buffered())
 		if err == nil {
-			backend.Write(buffered)
+			if _, err := backend.Write(buffered); err != nil {
+				return err
+			}
 			reader.Discard(len(buffered))
 		}
 	}
@@ -146,4 +154,5 @@ func (p *RedisProxy) proxyWithReader(reader *bufio.Reader, client, backend net.C
 	if err != nil && err != io.EOF {
 		log.Printf("Error copying from client to backend: %v", err)
 	}
+	return err
 }

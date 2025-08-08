@@ -47,20 +47,22 @@ func (p *LDAPProxy) handleConnection(clientConn net.Conn) {
 	var wrappedBackendConn net.Conn = backendConn
 
 	if p.EnableTLS {
-		wrappedClientConn = tls.Server(clientConn, p.TLSConfig)
-		if err := wrappedClientConn.(*tls.Conn).Handshake(); err != nil {
+		tlsClientConn := tls.Server(clientConn, p.TLSConfig)
+		if err := tlsClientConn.Handshake(); err != nil {
 			log.Printf("TLS handshake with LDAP client failed: %v", err)
 			return
 		}
+		wrappedClientConn = tlsClientConn
 
 		tlsConfig := &tls.Config{
 			InsecureSkipVerify: true,
 		}
-		wrappedBackendConn = tls.Client(backendConn, tlsConfig)
-		if err := wrappedBackendConn.(*tls.Conn).Handshake(); err != nil {
+		tlsBackendConn := tls.Client(backendConn, tlsConfig)
+		if err := tlsBackendConn.Handshake(); err != nil {
 			log.Printf("TLS handshake with LDAP backend failed: %v", err)
 			return
 		}
+		wrappedBackendConn = tlsBackendConn
 	}
 
 	errc := make(chan error, 2)
