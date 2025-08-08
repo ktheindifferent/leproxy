@@ -63,7 +63,7 @@ func TestSetupServer(t *testing.T) {
 	}
 
 	// Create a test mapping file
-	testMapping := map[string]string{
+	_ = map[string]string{
 		"test.example.com": "127.0.0.1:8080",
 	}
 
