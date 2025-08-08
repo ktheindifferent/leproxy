@@ -7,7 +7,7 @@ import (
 	"crypto/tls"
 	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -240,7 +240,7 @@ func setProxy(mapping map[string]string) (http.Handler, error) {
 			switch u.Scheme {
 			case "http", "https":
 				rp := newSingleHostReverseProxy(u)
-				rp.ErrorLog = log.New(ioutil.Discard, "", 0)
+				rp.ErrorLog = log.New(io.Discard, "", 0)
 				rp.BufferPool = bufPool{}
 				mux.Handle(hostname+"/", rp)
 				continue
@@ -257,7 +257,7 @@ func setProxy(mapping map[string]string) (http.Handler, error) {
 					return net.DialTimeout(network, backendAddr, 5*time.Second)
 				},
 			},
-			ErrorLog:   log.New(ioutil.Discard, "", 0),
+			ErrorLog:   log.New(io.Discard, "", 0),
 			BufferPool: bufPool{},
 		}
 		mux.Handle(hostname+"/", rp)
@@ -467,9 +467,10 @@ func readDBProxyConfig(file string) ([]dbProxyConfig, error) {
 			continue
 		}
 
-		parts := strings.SplitN(line, ":", 4)
-		if len(parts) < 3 {
-			return nil, fmt.Errorf("invalid database proxy config line: %q (expected format: host:port:type:backend[:tls])", line)
+		// Split into all parts first
+		parts := strings.Split(line, ":")
+		if len(parts) < 4 {
+			return nil, fmt.Errorf("invalid database proxy config line: %q (expected format: host:port:type:backend_host:backend_port[:tls])", line)
 		}
 
 		config := dbProxyConfig{
@@ -477,16 +478,18 @@ func readDBProxyConfig(file string) ([]dbProxyConfig, error) {
 			ProxyType:  parts[2],
 		}
 
-		if len(parts) >= 4 {
-			backendParts := strings.Split(parts[3], ":")
-			if len(backendParts) >= 2 {
-				config.Backend = net.JoinHostPort(backendParts[0], backendParts[1])
-				if len(backendParts) > 2 && strings.ToLower(backendParts[2]) == "tls" {
-					config.EnableTLS = true
-				}
-			} else {
-				config.Backend = parts[3]
+		// Handle backend configuration
+		// Parts[3] and beyond contain the backend configuration
+		if len(parts) >= 5 {
+			// Backend host and port are in parts[3] and parts[4]
+			config.Backend = net.JoinHostPort(parts[3], parts[4])
+			// Check for TLS flag
+			if len(parts) > 5 && strings.ToLower(parts[5]) == "tls" {
+				config.EnableTLS = true
 			}
+		} else {
+			// Fallback for simpler format (might be unix socket or similar)
+			config.Backend = parts[3]
 		}
 
 		configs = append(configs, config)
