@@ -190,7 +190,7 @@ func setupServer(addr, mapfile, cacheDir, email string, hsts bool, provider, acm
 			}
 			
 			// Create account with EAB
-			acct := &acme.Account{
+			_ = &acme.Account{
 				Contact: []string{"mailto:" + email},
 			}
 			
@@ -227,7 +227,7 @@ func setProxy(mapping map[string]string) (http.Handler, error) {
 			// append \0 to address so addrlen for connect(2) is
 			// calculated in a way compatible with some other
 			// implementations (i.e. uwsgi)
-			network, backendAddr = "unix", backendAddr+string(0)
+			network, backendAddr = "unix", backendAddr+"\x00"
 		} else if filepath.IsAbs(backendAddr) {
 			network = "unix"
 			if strings.HasSuffix(backendAddr, string(os.PathSeparator)) {
@@ -446,6 +446,18 @@ func startSingleDBProxy(config dbProxyConfig, certManager *dbproxy.CertManager) 
 	case "postgres", "postgresql":
 		proxy := dbproxy.NewPostgresProxy(config.Backend, tlsConfig)
 		log.Printf("Starting Postgres proxy on %s -> %s (TLS: %v)", config.ListenAddr, config.Backend, config.EnableTLS)
+		return proxy.Serve(listener)
+	case "mysql":
+		proxy := dbproxy.NewMySQLProxy(config.Backend, tlsConfig)
+		log.Printf("Starting MySQL proxy on %s -> %s (TLS: %v)", config.ListenAddr, config.Backend, config.EnableTLS)
+		return proxy.Serve(listener)
+	case "redis":
+		proxy := dbproxy.NewRedisProxy(config.Backend, tlsConfig)
+		log.Printf("Starting Redis proxy on %s -> %s (TLS: %v)", config.ListenAddr, config.Backend, config.EnableTLS)
+		return proxy.Serve(listener)
+	case "mongodb", "mongo":
+		proxy := dbproxy.NewMongoDBProxy(config.Backend, tlsConfig)
+		log.Printf("Starting MongoDB proxy on %s -> %s (TLS: %v)", config.ListenAddr, config.Backend, config.EnableTLS)
 		return proxy.Serve(listener)
 	default:
 		return fmt.Errorf("unsupported proxy type: %s", config.ProxyType)
