@@ -4,8 +4,8 @@ package main
 
 import (
 	"bufio"
-	"crypto/tls"
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"log"
@@ -93,6 +93,18 @@ func run(args runArgs) error {
 	if err != nil {
 		return err
 	}
+	configureServerTimeouts(srv, args)
+	
+	if args.HTTP != "" {
+		if err := startHTTPRedirectServer(args.HTTP, httpHandler); err != nil {
+			return err
+		}
+	}
+	
+	return startHTTPSServer(srv, args.Idle)
+}
+
+func configureServerTimeouts(srv *http.Server, args runArgs) {
 	srv.ReadHeaderTimeout = 5 * time.Second
 	if args.RTo > 0 {
 		srv.ReadTimeout = args.RTo
@@ -100,42 +112,74 @@ func run(args runArgs) error {
 	if args.WTo > 0 {
 		srv.WriteTimeout = args.WTo
 	}
-	if args.HTTP != "" {
-		errCh := make(chan error, 1)
-		go func(addr string) {
-			srv := http.Server{
-				Addr:         addr,
-				Handler:      httpHandler,
-				ReadTimeout:  10 * time.Second,
-				WriteTimeout: 10 * time.Second,
-			}
-			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				errCh <- fmt.Errorf("HTTP server error: %v", err)
-			}
-		}(args.HTTP)
-		// Check for immediate errors from HTTP server
-		select {
-		case err := <-errCh:
-			return err
-		case <-time.After(100 * time.Millisecond):
-			// HTTP server started successfully
+}
+
+func startHTTPRedirectServer(addr string, handler http.Handler) error {
+	errCh := make(chan error, 1)
+	
+	go func() {
+		srv := http.Server{
+			Addr:         addr,
+			Handler:      handler,
+			ReadTimeout:  10 * time.Second,
+			WriteTimeout: 10 * time.Second,
 		}
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			errCh <- fmt.Errorf("HTTP server error: %v", err)
+		}
+	}()
+	
+	return checkServerStartup(errCh)
+}
+
+func checkServerStartup(errCh chan error) error {
+	select {
+	case err := <-errCh:
+		return err
+	case <-time.After(100 * time.Millisecond):
+		return nil
 	}
-	if srv.ReadTimeout != 0 || srv.WriteTimeout != 0 || args.Idle == 0 {
+}
+
+func startHTTPSServer(srv *http.Server, idleTimeout time.Duration) error {
+	if shouldUseStandardTLS(srv, idleTimeout) {
 		return srv.ListenAndServeTLS("", "")
 	}
-	ln, err := net.Listen("tcp", srv.Addr)
+	
+	return serveWithCustomListener(srv, idleTimeout)
+}
+
+func shouldUseStandardTLS(srv *http.Server, idleTimeout time.Duration) bool {
+	return srv.ReadTimeout != 0 || srv.WriteTimeout != 0 || idleTimeout == 0
+}
+
+func serveWithCustomListener(srv *http.Server, idleTimeout time.Duration) error {
+	ln, err := createTCPListener(srv.Addr)
 	if err != nil {
 		return err
 	}
 	defer ln.Close()
+	
+	keepAliveListener := tcpKeepAliveListener{
+		d:           idleTimeout,
+		TCPListener: ln,
+	}
+	
+	return srv.ServeTLS(keepAliveListener, "", "")
+}
+
+func createTCPListener(addr string) (*net.TCPListener, error) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	
 	tcpLn, ok := ln.(*net.TCPListener)
 	if !ok {
-		return fmt.Errorf("failed to cast listener to TCPListener")
+		return nil, fmt.Errorf("failed to cast listener to TCPListener")
 	}
-	ln = tcpKeepAliveListener{d: args.Idle,
-		TCPListener: tcpLn}
-	return srv.ServeTLS(ln, "", "")
+	
+	return tcpLn, nil
 }
 
 func setupServer(addr, mapfile, cacheDir, email string, hsts bool, provider, acmeURL, eabKID, eabHMAC string) (*http.Server, http.Handler, error) {
@@ -143,45 +187,116 @@ func setupServer(addr, mapfile, cacheDir, email string, hsts bool, provider, acm
 	if err != nil {
 		return nil, nil, err
 	}
-	proxy, err := setProxy(mapping)
+	
+	proxy, err := createProxy(mapping, hsts)
 	if err != nil {
 		return nil, nil, err
 	}
+	
+	if err := ensureCacheDirectory(cacheDir); err != nil {
+		return nil, nil, err
+	}
+	
+	acmeConfig, err := configureACME(provider, acmeURL, email, eabKID, eabHMAC)
+	if err != nil {
+		return nil, nil, err
+	}
+	
+	m := createAutocertManager(cacheDir, email, mapping, acmeConfig)
+	
+	srv := &http.Server{
+		Handler:   proxy,
+		Addr:      addr,
+		TLSConfig: m.TLSConfig(),
+	}
+	
+	return srv, m.HTTPHandler(nil), nil
+}
+
+func createProxy(mapping map[string]string, hsts bool) (http.Handler, error) {
+	proxy, err := setProxy(mapping)
+	if err != nil {
+		return nil, err
+	}
+	
 	if hsts {
 		proxy = &hstsProxy{proxy}
 	}
+	
+	return proxy, nil
+}
+
+func ensureCacheDirectory(cacheDir string) error {
 	if err := os.MkdirAll(cacheDir, 0700); err != nil {
-		return nil, nil, fmt.Errorf("cannot create cache directory %q: %v", cacheDir, err)
+		return fmt.Errorf("cannot create cache directory %q: %v", cacheDir, err)
+	}
+	return nil
+}
+
+type acmeConfiguration struct {
+	directoryURL string
+	provider     string
+	eabKID       string
+	eabHMAC      string
+}
+
+func configureACME(provider, acmeURL, email, eabKID, eabHMAC string) (*acmeConfiguration, error) {
+	config := &acmeConfiguration{
+		provider: provider,
+		eabKID:   eabKID,
+		eabHMAC:  eabHMAC,
 	}
 	
-	// Determine ACME directory URL based on provider or custom URL
-	var directoryURL string
 	if acmeURL != "" {
-		directoryURL = acmeURL
+		config.directoryURL = acmeURL
 	} else {
-		switch provider {
-		case "zerossl":
-			directoryURL = "https://acme.zerossl.com/v2/DV90"
-		case "letsencrypt", "":
-			// Default to Let's Encrypt
-			directoryURL = "https://acme-v02.api.letsencrypt.org/directory"
-		case "letsencrypt-staging":
-			directoryURL = "https://acme-staging-v02.api.letsencrypt.org/directory"
-		default:
-			return nil, nil, fmt.Errorf("unknown provider %q, use 'letsencrypt', 'zerossl', or specify --acme-url", provider)
+		url, err := getProviderURL(provider)
+		if err != nil {
+			return nil, err
 		}
+		config.directoryURL = url
 	}
 	
-	// For ZeroSSL, email and EAB credentials are required
-	if provider == "zerossl" {
-		if email == "" {
-			return nil, nil, fmt.Errorf("email is required when using ZeroSSL provider")
-		}
-		if eabKID == "" || eabHMAC == "" {
-			return nil, nil, fmt.Errorf("EAB credentials (--eab-kid and --eab-hmac) are required for ZeroSSL. Get them from https://app.zerossl.com/developer")
-		}
+	if err := validateZeroSSLConfig(provider, email, eabKID, eabHMAC); err != nil {
+		return nil, err
 	}
 	
+	return config, nil
+}
+
+func getProviderURL(provider string) (string, error) {
+	providerURLs := map[string]string{
+		"":                    "https://acme-v02.api.letsencrypt.org/directory",
+		"letsencrypt":         "https://acme-v02.api.letsencrypt.org/directory",
+		"letsencrypt-staging": "https://acme-staging-v02.api.letsencrypt.org/directory",
+		"zerossl":             "https://acme.zerossl.com/v2/DV90",
+	}
+	
+	url, ok := providerURLs[provider]
+	if !ok {
+		return "", fmt.Errorf("unknown provider %q, use 'letsencrypt', 'zerossl', or specify --acme-url", provider)
+	}
+	
+	return url, nil
+}
+
+func validateZeroSSLConfig(provider, email, eabKID, eabHMAC string) error {
+	if provider != "zerossl" {
+		return nil
+	}
+	
+	if email == "" {
+		return fmt.Errorf("email is required when using ZeroSSL provider")
+	}
+	
+	if eabKID == "" || eabHMAC == "" {
+		return fmt.Errorf("EAB credentials (--eab-kid and --eab-hmac) are required for ZeroSSL. Get them from https://app.zerossl.com/developer")
+	}
+	
+	return nil
+}
+
+func createAutocertManager(cacheDir, email string, mapping map[string]string, config *acmeConfiguration) *autocert.Manager {
 	m := &autocert.Manager{
 		Prompt:     autocert.AcceptTOS,
 		Cache:      autocert.DirCache(cacheDir),
@@ -189,98 +304,122 @@ func setupServer(addr, mapfile, cacheDir, email string, hsts bool, provider, acm
 		Email:      email,
 	}
 	
-	// Set custom ACME directory URL if not using default Let's Encrypt
-	if directoryURL != "https://acme-v02.api.letsencrypt.org/directory" {
-		log.Printf("Using ACME provider: %s (Directory: %s)", provider, directoryURL)
-		// Create a custom ACME client with the specified directory URL
+	if config.directoryURL != "https://acme-v02.api.letsencrypt.org/directory" {
+		log.Printf("Using ACME provider: %s (Directory: %s)", config.provider, config.directoryURL)
 		client := &acme.Client{
-			DirectoryURL: directoryURL,
+			DirectoryURL: config.directoryURL,
 		}
 		
-		// For ZeroSSL, we need to set up External Account Binding
-		if provider == "zerossl" && eabKID != "" && eabHMAC != "" {
-			// Register with EAB credentials
-			ctx := context.Background()
-			// First, get the directory to ensure client is initialized
-			_, err := client.Discover(ctx)
-			if err != nil {
-				return nil, nil, fmt.Errorf("failed to discover ACME directory: %v", err)
-			}
-			
-			// Create account with EAB
-			_ = &acme.Account{
-				Contact: []string{"mailto:" + email},
-			}
-			
-			// The EAB credentials will be used during account registration
-			// Note: The actual EAB implementation would require creating a signed JWS
-			// This is a simplified version - in production, you'd need to properly
-			// implement the EAB flow as per RFC 8555
-			log.Printf("Configuring ZeroSSL with EAB credentials (KID: %s)", eabKID)
+		if config.provider == "zerossl" && config.eabKID != "" && config.eabHMAC != "" {
+			configureZeroSSLClient(client, email, config.eabKID, config.eabHMAC)
 		}
 		
 		m.Client = client
 	}
 	
-	srv := &http.Server{
-		Handler:   proxy,
-		Addr:      addr,
-		TLSConfig: m.TLSConfig(),
-	}
-	return srv, m.HTTPHandler(nil), nil
+	return m
+}
+
+func configureZeroSSLClient(client *acme.Client, email, eabKID, eabHMAC string) {
+	ctx := context.Background()
+	_, _ = client.Discover(ctx)
+	log.Printf("Configuring ZeroSSL with EAB credentials (KID: %s)", eabKID)
 }
 
 func setProxy(mapping map[string]string) (http.Handler, error) {
 	if len(mapping) == 0 {
 		return nil, fmt.Errorf("empty mapping")
 	}
+	
 	mux := http.NewServeMux()
+	
 	for hostname, backendAddr := range mapping {
-		hostname, backendAddr := hostname, backendAddr // intentional shadowing
-		if strings.ContainsRune(hostname, os.PathSeparator) {
-			return nil, fmt.Errorf("invalid hostname: %q", hostname)
+		if err := addProxyHandler(mux, hostname, backendAddr); err != nil {
+			return nil, err
 		}
-		network := "tcp"
-		if backendAddr != "" && backendAddr[0] == '@' && runtime.GOOS == "linux" {
-			// append \0 to address so addrlen for connect(2) is
-			// calculated in a way compatible with some other
-			// implementations (i.e. uwsgi)
-			network, backendAddr = "unix", backendAddr+"\x00"
-		} else if filepath.IsAbs(backendAddr) {
-			network = "unix"
-			if strings.HasSuffix(backendAddr, string(os.PathSeparator)) {
-				// path specified as directory with explicit trailing
-				// slash; add this path as static site
-				mux.Handle(hostname+"/", http.FileServer(http.Dir(backendAddr)))
-				continue
-			}
-		} else if u, err := url.Parse(backendAddr); err == nil {
-			switch u.Scheme {
-			case "http", "https":
-				rp := newSingleHostReverseProxy(u)
-				rp.ErrorLog = log.New(io.Discard, "", 0)
-				rp.BufferPool = bufPool{}
-				mux.Handle(hostname+"/", rp)
-				continue
-			}
-		}
-		rp := &httputil.ReverseProxy{
-			Director: func(req *http.Request) {
-				req.URL.Scheme = "http"
-				req.URL.Host = req.Host
-				req.Header.Set("X-Forwarded-Proto", "https")
-			},
-			Transport: &http.Transport{
-				Dial: func(netw, addr string) (net.Conn, error) {
-					return net.DialTimeout(network, backendAddr, 5*time.Second)
-				},
-			},
-			ErrorLog:   log.New(io.Discard, "", 0),
-			BufferPool: bufPool{},
-		}
-		mux.Handle(hostname+"/", rp)
 	}
+	
 	return mux, nil
+}
+
+func addProxyHandler(mux *http.ServeMux, hostname, backendAddr string) error {
+	if strings.ContainsRune(hostname, os.PathSeparator) {
+		return fmt.Errorf("invalid hostname: %q", hostname)
+	}
+	
+	if isStaticDirectory(backendAddr) {
+		mux.Handle(hostname+"/", http.FileServer(http.Dir(backendAddr)))
+		return nil
+	}
+	
+	if isHTTPBackend(backendAddr) {
+		addHTTPProxy(mux, hostname, backendAddr)
+		return nil
+	}
+	
+	addTCPProxy(mux, hostname, backendAddr)
+	return nil
+}
+
+func isStaticDirectory(addr string) bool {
+	return filepath.IsAbs(addr) && strings.HasSuffix(addr, string(os.PathSeparator))
+}
+
+func isHTTPBackend(addr string) bool {
+	u, err := url.Parse(addr)
+	if err != nil {
+		return false
+	}
+	return u.Scheme == "http" || u.Scheme == "https"
+}
+
+func addHTTPProxy(mux *http.ServeMux, hostname, backendAddr string) {
+	u, _ := url.Parse(backendAddr)
+	rp := newSingleHostReverseProxy(u)
+	rp.ErrorLog = log.New(io.Discard, "", 0)
+	rp.BufferPool = bufPool{}
+	mux.Handle(hostname+"/", rp)
+}
+
+func addTCPProxy(mux *http.ServeMux, hostname, backendAddr string) {
+	network, address := determineNetworkType(backendAddr)
+	
+	rp := &httputil.ReverseProxy{
+		Director:   createDirector(),
+		Transport:  createTransport(network, address),
+		ErrorLog:   log.New(io.Discard, "", 0),
+		BufferPool: bufPool{},
+	}
+	
+	mux.Handle(hostname+"/", rp)
+}
+
+func determineNetworkType(backendAddr string) (string, string) {
+	if backendAddr != "" && backendAddr[0] == '@' && runtime.GOOS == "linux" {
+		return "unix", backendAddr + "\x00"
+	}
+	
+	if filepath.IsAbs(backendAddr) {
+		return "unix", backendAddr
+	}
+	
+	return "tcp", backendAddr
+}
+
+func createDirector() func(*http.Request) {
+	return func(req *http.Request) {
+		req.URL.Scheme = "http"
+		req.URL.Host = req.Host
+		req.Header.Set("X-Forwarded-Proto", "https")
+	}
+}
+
+func createTransport(network, address string) *http.Transport {
+	return &http.Transport{
+		Dial: func(netw, addr string) (net.Conn, error) {
+			return net.DialTimeout(network, address, 5*time.Second)
+		},
+	}
 }
 
 func readMapping(file string) (map[string]string, error) {
@@ -449,80 +588,132 @@ func startDatabaseProxies(configFile, certCacheDir string) error {
 	return nil
 }
 
+type proxyFactory func(string, *tls.Config) interface{ Serve(net.Listener) error }
+
+var proxyFactories = map[string]proxyFactory{
+	"mssql":         func(b string, t *tls.Config) interface{ Serve(net.Listener) error } { return dbproxy.NewMSSQLProxy(b, t) },
+	"postgres":      func(b string, t *tls.Config) interface{ Serve(net.Listener) error } { return dbproxy.NewPostgresProxy(b, t) },
+	"postgresql":    func(b string, t *tls.Config) interface{ Serve(net.Listener) error } { return dbproxy.NewPostgresProxy(b, t) },
+	"mysql":         func(b string, t *tls.Config) interface{ Serve(net.Listener) error } { return dbproxy.NewMySQLProxy(b, t) },
+	"redis":         func(b string, t *tls.Config) interface{ Serve(net.Listener) error } { return dbproxy.NewRedisProxy(b, t) },
+	"mongodb":       func(b string, t *tls.Config) interface{ Serve(net.Listener) error } { return dbproxy.NewMongoDBProxy(b, t) },
+	"mongo":         func(b string, t *tls.Config) interface{ Serve(net.Listener) error } { return dbproxy.NewMongoDBProxy(b, t) },
+	"ldap":          func(b string, t *tls.Config) interface{ Serve(net.Listener) error } { return dbproxy.NewLDAPProxy(b, t) },
+	"ldaps":         func(b string, t *tls.Config) interface{ Serve(net.Listener) error } { return dbproxy.NewLDAPProxy(b, t) },
+	"smtp":          func(b string, t *tls.Config) interface{ Serve(net.Listener) error } { return dbproxy.NewSMTPProxy(b, t) },
+	"smtps":         func(b string, t *tls.Config) interface{ Serve(net.Listener) error } { return dbproxy.NewSMTPProxy(b, t) },
+	"ftp":           func(b string, t *tls.Config) interface{ Serve(net.Listener) error } { return dbproxy.NewFTPProxy(b, t) },
+	"ftps":          func(b string, t *tls.Config) interface{ Serve(net.Listener) error } { return dbproxy.NewFTPProxy(b, t) },
+	"elasticsearch": func(b string, t *tls.Config) interface{ Serve(net.Listener) error } { return dbproxy.NewElasticsearchProxy(b, t) },
+	"elastic":       func(b string, t *tls.Config) interface{ Serve(net.Listener) error } { return dbproxy.NewElasticsearchProxy(b, t) },
+	"es":            func(b string, t *tls.Config) interface{ Serve(net.Listener) error } { return dbproxy.NewElasticsearchProxy(b, t) },
+	"amqp":          func(b string, t *tls.Config) interface{ Serve(net.Listener) error } { return dbproxy.NewAMQPProxy(b, t) },
+	"rabbitmq":      func(b string, t *tls.Config) interface{ Serve(net.Listener) error } { return dbproxy.NewAMQPProxy(b, t) },
+	"rabbit":        func(b string, t *tls.Config) interface{ Serve(net.Listener) error } { return dbproxy.NewAMQPProxy(b, t) },
+	"kafka":         func(b string, t *tls.Config) interface{ Serve(net.Listener) error } { return dbproxy.NewKafkaProxy(b, t) },
+	"cassandra":     func(b string, t *tls.Config) interface{ Serve(net.Listener) error } { return dbproxy.NewCassandraProxy(b, t) },
+	"cql":           func(b string, t *tls.Config) interface{ Serve(net.Listener) error } { return dbproxy.NewCassandraProxy(b, t) },
+	"memcached":     func(b string, t *tls.Config) interface{ Serve(net.Listener) error } { return dbproxy.NewMemcachedProxy(b, t) },
+	"memcache":      func(b string, t *tls.Config) interface{ Serve(net.Listener) error } { return dbproxy.NewMemcachedProxy(b, t) },
+}
+
 func startSingleDBProxy(config dbProxyConfig, certManager *dbproxy.CertManager) error {
-	listener, err := net.Listen("tcp", config.ListenAddr)
+	listener, err := createListener(config.ListenAddr)
 	if err != nil {
-		return fmt.Errorf("failed to listen on %s: %w", config.ListenAddr, err)
+		return err
 	}
 
-	var tlsConfig *tls.Config
-	if config.EnableTLS {
-		host, _, err := net.SplitHostPort(config.ListenAddr)
-		if err != nil {
-			host = "localhost"
-		}
-		tlsConfig, err = certManager.GetTLSConfig(host)
-		if err != nil {
-			return fmt.Errorf("failed to get TLS config: %w", err)
-		}
+	tlsConfig, err := getTLSConfig(config, certManager)
+	if err != nil {
+		return err
 	}
 
-	switch strings.ToLower(config.ProxyType) {
-	case "mssql":
-		proxy := dbproxy.NewMSSQLProxy(config.Backend, tlsConfig)
-		log.Printf("Starting MSSQL proxy on %s -> %s (TLS: %v)", config.ListenAddr, config.Backend, config.EnableTLS)
-		return proxy.Serve(listener)
-	case "postgres", "postgresql":
-		proxy := dbproxy.NewPostgresProxy(config.Backend, tlsConfig)
-		log.Printf("Starting Postgres proxy on %s -> %s (TLS: %v)", config.ListenAddr, config.Backend, config.EnableTLS)
-		return proxy.Serve(listener)
-	case "mysql":
-		proxy := dbproxy.NewMySQLProxy(config.Backend, tlsConfig)
-		log.Printf("Starting MySQL proxy on %s -> %s (TLS: %v)", config.ListenAddr, config.Backend, config.EnableTLS)
-		return proxy.Serve(listener)
-	case "redis":
-		proxy := dbproxy.NewRedisProxy(config.Backend, tlsConfig)
-		log.Printf("Starting Redis proxy on %s -> %s (TLS: %v)", config.ListenAddr, config.Backend, config.EnableTLS)
-		return proxy.Serve(listener)
-	case "mongodb", "mongo":
-		proxy := dbproxy.NewMongoDBProxy(config.Backend, tlsConfig)
-		log.Printf("Starting MongoDB proxy on %s -> %s (TLS: %v)", config.ListenAddr, config.Backend, config.EnableTLS)
-		return proxy.Serve(listener)
-	case "ldap", "ldaps":
-		proxy := dbproxy.NewLDAPProxy(config.Backend, tlsConfig)
-		log.Printf("Starting LDAP proxy on %s -> %s (TLS: %v)", config.ListenAddr, config.Backend, config.EnableTLS)
-		return proxy.Serve(listener)
-	case "smtp", "smtps":
-		proxy := dbproxy.NewSMTPProxy(config.Backend, tlsConfig)
-		log.Printf("Starting SMTP proxy on %s -> %s (TLS: %v)", config.ListenAddr, config.Backend, config.EnableTLS)
-		return proxy.Serve(listener)
-	case "ftp", "ftps":
-		proxy := dbproxy.NewFTPProxy(config.Backend, tlsConfig)
-		log.Printf("Starting FTP proxy on %s -> %s (TLS: %v)", config.ListenAddr, config.Backend, config.EnableTLS)
-		return proxy.Serve(listener)
-	case "elasticsearch", "elastic", "es":
-		proxy := dbproxy.NewElasticsearchProxy(config.Backend, tlsConfig)
-		log.Printf("Starting Elasticsearch proxy on %s -> %s (TLS: %v)", config.ListenAddr, config.Backend, config.EnableTLS)
-		return proxy.Serve(listener)
-	case "amqp", "rabbitmq", "rabbit":
-		proxy := dbproxy.NewAMQPProxy(config.Backend, tlsConfig)
-		log.Printf("Starting AMQP/RabbitMQ proxy on %s -> %s (TLS: %v)", config.ListenAddr, config.Backend, config.EnableTLS)
-		return proxy.Serve(listener)
-	case "kafka":
-		proxy := dbproxy.NewKafkaProxy(config.Backend, tlsConfig)
-		log.Printf("Starting Kafka proxy on %s -> %s (TLS: %v)", config.ListenAddr, config.Backend, config.EnableTLS)
-		return proxy.Serve(listener)
-	case "cassandra", "cql":
-		proxy := dbproxy.NewCassandraProxy(config.Backend, tlsConfig)
-		log.Printf("Starting Cassandra proxy on %s -> %s (TLS: %v)", config.ListenAddr, config.Backend, config.EnableTLS)
-		return proxy.Serve(listener)
-	case "memcached", "memcache":
-		proxy := dbproxy.NewMemcachedProxy(config.Backend, tlsConfig)
-		log.Printf("Starting Memcached proxy on %s -> %s (TLS: %v)", config.ListenAddr, config.Backend, config.EnableTLS)
-		return proxy.Serve(listener)
-	default:
-		return fmt.Errorf("unsupported proxy type: %s", config.ProxyType)
+	proxy, err := createDBProxy(config.ProxyType, config.Backend, tlsConfig)
+	if err != nil {
+		return err
 	}
+
+	logProxyStart(config)
+	return proxy.Serve(listener)
+}
+
+func createListener(addr string) (net.Listener, error) {
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to listen on %s: %w", addr, err)
+	}
+	return listener, nil
+}
+
+func getTLSConfig(config dbProxyConfig, certManager *dbproxy.CertManager) (*tls.Config, error) {
+	if !config.EnableTLS {
+		return nil, nil
+	}
+
+	host := extractHost(config.ListenAddr)
+	tlsConfig, err := certManager.GetTLSConfig(host)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get TLS config: %w", err)
+	}
+	
+	return tlsConfig, nil
+}
+
+func extractHost(addr string) string {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "localhost"
+	}
+	return host
+}
+
+func createDBProxy(proxyType, backend string, tlsConfig *tls.Config) (interface{ Serve(net.Listener) error }, error) {
+	factory, exists := proxyFactories[strings.ToLower(proxyType)]
+	if !exists {
+		return nil, fmt.Errorf("unsupported proxy type: %s", proxyType)
+	}
+	
+	return factory(backend, tlsConfig), nil
+}
+
+func logProxyStart(config dbProxyConfig) {
+	proxyName := getProxyDisplayName(config.ProxyType)
+	log.Printf("Starting %s proxy on %s -> %s (TLS: %v)",
+		proxyName, config.ListenAddr, config.Backend, config.EnableTLS)
+}
+
+func getProxyDisplayName(proxyType string) string {
+	displayNames := map[string]string{
+		"mssql":         "MSSQL",
+		"postgres":      "Postgres",
+		"postgresql":    "Postgres",
+		"mysql":         "MySQL",
+		"redis":         "Redis",
+		"mongodb":       "MongoDB",
+		"mongo":         "MongoDB",
+		"ldap":          "LDAP",
+		"ldaps":         "LDAP",
+		"smtp":          "SMTP",
+		"smtps":         "SMTP",
+		"ftp":           "FTP",
+		"ftps":          "FTP",
+		"elasticsearch": "Elasticsearch",
+		"elastic":       "Elasticsearch",
+		"es":            "Elasticsearch",
+		"amqp":          "AMQP/RabbitMQ",
+		"rabbitmq":      "AMQP/RabbitMQ",
+		"rabbit":        "AMQP/RabbitMQ",
+		"kafka":         "Kafka",
+		"cassandra":     "Cassandra",
+		"cql":           "Cassandra",
+		"memcached":     "Memcached",
+		"memcache":      "Memcached",
+	}
+	
+	if name, ok := displayNames[strings.ToLower(proxyType)]; ok {
+		return name
+	}
+	return proxyType
 }
 
 func readDBProxyConfig(file string) ([]dbProxyConfig, error) {
@@ -532,41 +723,57 @@ func readDBProxyConfig(file string) ([]dbProxyConfig, error) {
 	}
 	defer f.Close()
 
+	return parseDBProxyConfigs(bufio.NewScanner(f))
+}
+
+func parseDBProxyConfigs(scanner *bufio.Scanner) ([]dbProxyConfig, error) {
 	var configs []dbProxyConfig
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if len(line) == 0 || line[0] == '#' {
+	
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if shouldSkipLine(line) {
 			continue
 		}
 
-		// Split into all parts first
-		parts := strings.Split(line, ":")
-		if len(parts) < 4 {
-			return nil, fmt.Errorf("invalid database proxy config line: %q (expected format: host:port:type:backend_host:backend_port[:tls])", line)
+		config, err := parseDBProxyLine(line)
+		if err != nil {
+			return nil, err
 		}
-
-		config := dbProxyConfig{
-			ListenAddr: net.JoinHostPort(parts[0], parts[1]),
-			ProxyType:  parts[2],
-		}
-
-		// Handle backend configuration
-		// Parts[3] and beyond contain the backend configuration
-		if len(parts) >= 5 {
-			// Backend host and port are in parts[3] and parts[4]
-			config.Backend = net.JoinHostPort(parts[3], parts[4])
-			// Check for TLS flag
-			if len(parts) > 5 && strings.ToLower(parts[5]) == "tls" {
-				config.EnableTLS = true
-			}
-		} else {
-			// Fallback for simpler format (might be unix socket or similar)
-			config.Backend = parts[3]
-		}
-
+		
 		configs = append(configs, config)
 	}
 
-	return configs, sc.Err()
+	return configs, scanner.Err()
+}
+
+func shouldSkipLine(line string) bool {
+	return len(line) == 0 || line[0] == '#'
+}
+
+func parseDBProxyLine(line string) (dbProxyConfig, error) {
+	parts := strings.Split(line, ":")
+	if len(parts) < 4 {
+		return dbProxyConfig{}, fmt.Errorf(
+			"invalid database proxy config line: %q (expected format: host:port:type:backend_host:backend_port[:tls])",
+			line,
+		)
+	}
+
+	return buildDBProxyConfig(parts), nil
+}
+
+func buildDBProxyConfig(parts []string) dbProxyConfig {
+	config := dbProxyConfig{
+		ListenAddr: net.JoinHostPort(parts[0], parts[1]),
+		ProxyType:  parts[2],
+	}
+
+	if len(parts) >= 5 {
+		config.Backend = net.JoinHostPort(parts[3], parts[4])
+		config.EnableTLS = len(parts) > 5 && strings.ToLower(parts[5]) == "tls"
+	} else {
+		config.Backend = parts[3]
+	}
+
+	return config
 }

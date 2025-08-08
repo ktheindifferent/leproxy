@@ -45,31 +45,56 @@ func (cm *ConfigManager) LoadHTTPMappings() (HTTPMapping, error) {
 		return make(HTTPMapping), nil
 	}
 
-	data, err := ioutil.ReadFile(cm.httpMappingFile)
+	data, err := readFileOrEmpty(cm.httpMappingFile)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return make(HTTPMapping), nil
-		}
 		return nil, err
 	}
 
+	return parseHTTPMappings(data), nil
+}
+
+func readFileOrEmpty(filepath string) ([]byte, error) {
+	data, err := ioutil.ReadFile(filepath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []byte{}, nil
+		}
+		return nil, err
+	}
+	return data, nil
+}
+
+func parseHTTPMappings(data []byte) HTTPMapping {
 	mappings := make(HTTPMapping)
 	scanner := bufio.NewScanner(strings.NewReader(string(data)))
+	
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
+		if isCommentOrEmpty(line) {
 			continue
 		}
 		
-		parts := strings.SplitN(line, ":", 2)
-		if len(parts) == 2 {
-			host := strings.TrimSpace(parts[0])
-			backend := strings.TrimSpace(parts[1])
+		if host, backend, ok := parseHTTPLine(line); ok {
 			mappings[host] = backend
 		}
 	}
+	
+	return mappings
+}
 
-	return mappings, nil
+func isCommentOrEmpty(line string) bool {
+	return line == "" || strings.HasPrefix(line, "#")
+}
+
+func parseHTTPLine(line string) (host, backend string, ok bool) {
+	parts := strings.SplitN(line, ":", 2)
+	if len(parts) != 2 {
+		return "", "", false
+	}
+	
+	host = strings.TrimSpace(parts[0])
+	backend = strings.TrimSpace(parts[1])
+	return host, backend, true
 }
 
 func (cm *ConfigManager) SaveHTTPMappings(mappings HTTPMapping) error {
@@ -101,39 +126,48 @@ func (cm *ConfigManager) LoadDBProxies() ([]DBProxyEntry, error) {
 		return []DBProxyEntry{}, nil
 	}
 
-	data, err := ioutil.ReadFile(cm.dbMappingFile)
+	data, err := readFileOrEmpty(cm.dbMappingFile)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return []DBProxyEntry{}, nil
-		}
 		return nil, err
 	}
 
+	return parseDBProxies(data), nil
+}
+
+func parseDBProxies(data []byte) []DBProxyEntry {
 	var entries []DBProxyEntry
 	lines := strings.Split(string(data), "\n")
+	
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
+		if isCommentOrEmpty(line) {
 			continue
 		}
 
-		parts := strings.Split(line, ":")
-		if len(parts) < 5 {
-			continue
+		if entry, ok := parseDBProxyLine(line); ok {
+			entries = append(entries, entry)
 		}
-
-		entry := DBProxyEntry{
-			Host:        parts[0],
-			Port:        parts[1],
-			Type:        parts[2],
-			BackendHost: parts[3],
-			BackendPort: parts[4],
-			TLS:         len(parts) > 5 && parts[5] == "tls",
-		}
-		entries = append(entries, entry)
 	}
 
-	return entries, nil
+	return entries
+}
+
+func parseDBProxyLine(line string) (DBProxyEntry, bool) {
+	parts := strings.Split(line, ":")
+	if len(parts) < 5 {
+		return DBProxyEntry{}, false
+	}
+
+	entry := DBProxyEntry{
+		Host:        parts[0],
+		Port:        parts[1],
+		Type:        parts[2],
+		BackendHost: parts[3],
+		BackendPort: parts[4],
+		TLS:         len(parts) > 5 && parts[5] == "tls",
+	}
+	
+	return entry, true
 }
 
 func (cm *ConfigManager) SaveDBProxies(entries []DBProxyEntry) error {
@@ -166,59 +200,83 @@ func (cm *ConfigManager) SaveDBProxies(entries []DBProxyEntry) error {
 func (cm *ConfigManager) HTTPMappingsHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		mappings, err := cm.LoadHTTPMappings()
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(mappings)
-
+		cm.handleGetHTTPMappings(w, r)
 	case http.MethodPost:
-		var mappings HTTPMapping
-		if err := json.NewDecoder(r.Body).Decode(&mappings); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		if err := cm.SaveHTTPMappings(mappings); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]string{"status": "success"})
-
+		cm.handlePostHTTPMappings(w, r)
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
 }
 
+func (cm *ConfigManager) handleGetHTTPMappings(w http.ResponseWriter, r *http.Request) {
+	mappings, err := cm.LoadHTTPMappings()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	
+	sendJSONResponse(w, mappings)
+}
+
+func (cm *ConfigManager) handlePostHTTPMappings(w http.ResponseWriter, r *http.Request) {
+	var mappings HTTPMapping
+	if err := json.NewDecoder(r.Body).Decode(&mappings); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	
+	if err := cm.SaveHTTPMappings(mappings); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	
+	sendSuccessResponse(w)
+}
+
 func (cm *ConfigManager) DBProxiesHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		proxies, err := cm.LoadDBProxies()
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(proxies)
-
+		cm.handleGetDBProxies(w, r)
 	case http.MethodPost:
-		var proxies []DBProxyEntry
-		if err := json.NewDecoder(r.Body).Decode(&proxies); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		if err := cm.SaveDBProxies(proxies); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]string{"status": "success"})
-
+		cm.handlePostDBProxies(w, r)
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+func (cm *ConfigManager) handleGetDBProxies(w http.ResponseWriter, r *http.Request) {
+	proxies, err := cm.LoadDBProxies()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	
+	sendJSONResponse(w, proxies)
+}
+
+func (cm *ConfigManager) handlePostDBProxies(w http.ResponseWriter, r *http.Request) {
+	var proxies []DBProxyEntry
+	if err := json.NewDecoder(r.Body).Decode(&proxies); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	
+	if err := cm.SaveDBProxies(proxies); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	
+	sendSuccessResponse(w)
+}
+
+func sendJSONResponse(w http.ResponseWriter, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(data)
+}
+
+func sendSuccessResponse(w http.ResponseWriter) {
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"status": "success"})
 }
 
 func basicAuth(handler http.HandlerFunc, username, password string) http.HandlerFunc {
@@ -235,26 +293,23 @@ func basicAuth(handler http.HandlerFunc, username, password string) http.Handler
 	}
 }
 
+func getConfigPath(envVar, defaultFile string) string {
+	filePath := os.Getenv(envVar)
+	if filePath == "" {
+		filePath = defaultFile
+	}
+	
+	if !filepath.IsAbs(filePath) {
+		cwd, _ := os.Getwd()
+		filePath = filepath.Join(cwd, filePath)
+	}
+	
+	return filePath
+}
+
 func main() {
-	httpMappingFile := os.Getenv("LEPROXY_HTTP_CONFIG")
-	if httpMappingFile == "" {
-		httpMappingFile = "mapping.yml"
-	}
-
-	dbMappingFile := os.Getenv("LEPROXY_DB_CONFIG")
-	if dbMappingFile == "" {
-		dbMappingFile = "dbproxy_config.yml"
-	}
-
-	if !filepath.IsAbs(httpMappingFile) {
-		cwd, _ := os.Getwd()
-		httpMappingFile = filepath.Join(cwd, httpMappingFile)
-	}
-
-	if !filepath.IsAbs(dbMappingFile) {
-		cwd, _ := os.Getwd()
-		dbMappingFile = filepath.Join(cwd, dbMappingFile)
-	}
+	httpMappingFile := getConfigPath("LEPROXY_HTTP_CONFIG", "mapping.yml")
+	dbMappingFile := getConfigPath("LEPROXY_DB_CONFIG", "dbproxy_config.yml")
 
 	adminUser := os.Getenv("LEPROXY_ADMIN_USER")
 	adminPass := os.Getenv("LEPROXY_ADMIN_PASS")
