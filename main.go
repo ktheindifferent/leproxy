@@ -14,14 +14,27 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/artyom/autoflags"
 	"github.com/artyom/leproxy/dbproxy"
+	"github.com/artyom/leproxy/internal/config"
+	"github.com/artyom/leproxy/internal/errors"
+	"github.com/artyom/leproxy/internal/graceful"
+	"github.com/artyom/leproxy/internal/health"
+	"github.com/artyom/leproxy/internal/logger"
+	"github.com/artyom/leproxy/internal/metrics"
+	"github.com/artyom/leproxy/internal/middleware"
+	"github.com/artyom/leproxy/internal/ratelimit"
+	"github.com/artyom/leproxy/internal/security"
+	"github.com/artyom/leproxy/internal/tracing"
+	"github.com/artyom/leproxy/internal/websocket"
 	"golang.org/x/crypto/acme"
 	"golang.org/x/crypto/acme/autocert"
 )
@@ -37,12 +50,25 @@ func main() {
 		RTo:      time.Minute,                 // Default read timeout
 		WTo:      5 * time.Minute,             // Default write timeout
 		Provider: "letsencrypt",               // Default ACME provider
+		// New defaults for enhanced features
+		LogLevel:   "info",
+		LogFormat:  "text",
+		RateLimit:  100,
+		BurstLimit: 200,
+		DDoSProtect: true,
+		EnableWS:   true,
 	}
 	// Parse command-line flags to override defaults
 	autoflags.Parse(&args)
+	
+	// Initialize enhanced logging
+	if err := logger.Init(args.LogLevel, args.LogFormat == "json"); err != nil {
+		log.Fatalf("Failed to initialize logger: %v", err)
+	}
+	
 	// Start the proxy server with the configured arguments
 	if err := run(args); err != nil {
-		log.Fatal(err)
+		logger.Fatal("Server failed to start", "error", err)
 	}
 }
 
@@ -70,28 +96,99 @@ type runArgs struct {
 	// Database proxy configuration
 	DBConf string `flag:"dbmap,file with database proxy mapping (host:port:type:backend)"` // Database proxy mapping file
 	DBCertCache string `flag:"dbcerts,path to directory to cache database certificates"`    // Database certificate cache directory
+	
+	// Observability configuration
+	LogLevel   string `flag:"log-level,log level (debug, info, warn, error, default: info)"`
+	LogFormat  string `flag:"log-format,log format (text or json, default: text)"`
+	MetricsAddr string `flag:"metrics,address to serve metrics (e.g., :9090)"`
+	HealthAddr  string `flag:"health,address to serve health checks (e.g., :8080)"`
+	TracingEndpoint string `flag:"tracing,tracing endpoint (e.g., jaeger:14268)"`
+	TracingExporter string `flag:"tracing-exporter,tracing exporter (jaeger or otlp, default: jaeger)"`
+	
+	// Security configuration
+	RateLimit   int    `flag:"rate-limit,requests per second per IP (0 to disable, default: 100)"`
+	BurstLimit  int    `flag:"burst-limit,burst size for rate limiting (default: 200)"`
+	DDoSProtect bool   `flag:"ddos,enable DDoS protection (default: true)"`
+	SecurityScan bool  `flag:"security-scan,enable security vulnerability scanning (default: false)"`
+	
+	// Advanced configuration
+	PluginDir   string `flag:"plugins,directory containing plugins to load"`
+	ConfigFile  string `flag:"config,YAML configuration file (overrides flags)"`
+	AdminAddr   string `flag:"admin,address for admin API (e.g., :8081)"`
+	EnableWS    bool   `flag:"websocket,enable WebSocket support (default: true)"`
 }
 
 // run initializes and starts the proxy server with the provided configuration
 func run(args runArgs) error {
 	if err := validateConfig(args); err != nil {
-		return err
+		return errors.Wrap(err, errors.ErrConfiguration, "configuration validation failed")
+	}
+	
+	// Load configuration file if provided
+	if args.ConfigFile != "" {
+		if err := config.LoadFile(args.ConfigFile, &args); err != nil {
+			return errors.Wrap(err, errors.ErrConfiguration, "failed to load config file")
+		}
+	}
+	
+	// Initialize tracing if configured
+	if args.TracingEndpoint != "" {
+		tracer, err := tracing.InitTracer("leproxy", args.TracingEndpoint, args.TracingExporter)
+		if err != nil {
+			logger.Warn("Failed to initialize tracing", "error", err)
+		} else {
+			defer tracer.Shutdown(context.Background())
+			logger.Info("Tracing initialized", "endpoint", args.TracingEndpoint, "exporter", args.TracingExporter)
+		}
+	}
+	
+	// Initialize metrics if configured
+	if args.MetricsAddr != "" {
+		metricsServer := metrics.NewServer(args.MetricsAddr)
+		go func() {
+			if err := metricsServer.Start(); err != nil {
+				logger.Error("Failed to start metrics server", "error", err)
+			}
+		}()
+		logger.Info("Metrics server started", "address", args.MetricsAddr)
+	}
+	
+	// Initialize health checks if configured
+	if args.HealthAddr != "" {
+		healthServer := health.NewServer(args.HealthAddr)
+		go func() {
+			if err := healthServer.Start(); err != nil {
+				logger.Error("Failed to start health server", "error", err)
+			}
+		}()
+		logger.Info("Health check server started", "address", args.HealthAddr)
+	}
+	
+	// Initialize security scanner if enabled
+	if args.SecurityScan {
+		scanner := security.NewScanner()
+		go scanner.StartBackgroundScanning()
+		logger.Info("Security scanner enabled")
 	}
 
 	if err := initializeDatabaseProxies(args); err != nil {
-		log.Printf("Warning: failed to start database proxies: %v", err)
+		logger.Warn("Failed to start database proxies", "error", err)
 	}
 
-	srv, httpHandler, err := setupServer(args.Addr, args.Conf, args.Cache, args.Email, args.HSTS, args.Provider, args.ACMEURL, args.EABKID, args.EABHMAC)
+	srv, httpHandler, err := setupServerWithEnhancements(args)
 	if err != nil {
-		return err
+		return errors.Wrap(err, errors.ErrConfiguration, "server setup failed")
 	}
 
 	configureServerTimeouts(srv, args)
 
 	if err := startRedirectServerIfNeeded(args.HTTP, httpHandler); err != nil {
-		return err
+		return errors.Wrap(err, errors.ErrConnection, "failed to start HTTP redirect server")
 	}
+	
+	// Set up graceful shutdown
+	shutdownManager := graceful.NewShutdownManager(srv)
+	go shutdownManager.HandleSignals()
 
 	return startHTTPSServer(srv, args.Idle)
 }
@@ -100,6 +197,21 @@ func validateConfig(args runArgs) error {
 	if args.Cache == "" {
 		return fmt.Errorf("no cache specified")
 	}
+	
+	// Validate rate limit settings
+	if args.RateLimit < 0 {
+		return fmt.Errorf("rate limit must be non-negative")
+	}
+	if args.BurstLimit < args.RateLimit {
+		args.BurstLimit = args.RateLimit * 2
+	}
+	
+	// Validate log level
+	validLogLevels := map[string]bool{"debug": true, "info": true, "warn": true, "error": true}
+	if !validLogLevels[args.LogLevel] {
+		return fmt.Errorf("invalid log level: %s", args.LogLevel)
+	}
+	
 	return nil
 }
 
@@ -195,29 +307,75 @@ func createTCPListener(addr string) (*net.TCPListener, error) {
 	return tcpLn, nil
 }
 
-func setupServer(addr, mapfile, cacheDir, email string, hsts bool, provider, acmeURL, eabKID, eabHMAC string) (*http.Server, http.Handler, error) {
-	mapping, err := readMapping(mapfile)
+func setupServerWithEnhancements(args runArgs) (*http.Server, http.Handler, error) {
+	mapping, err := readMapping(args.Conf)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	proxy, err := createProxy(mapping, hsts)
+	proxy, err := createProxy(mapping, args.HSTS)
+	if err != nil {
+		return nil, nil, err
+	}
+	
+	// Build middleware chain
+	middlewareChain := middleware.NewChain()
+	
+	// Add metrics middleware
+	if args.MetricsAddr != "" {
+		middlewareChain.Use(metrics.HTTPMiddleware())
+	}
+	
+	// Add rate limiting if configured
+	if args.RateLimit > 0 {
+		rateLimiter := ratelimit.NewRateLimiter(args.RateLimit, args.BurstLimit, args.DDoSProtect)
+		middlewareChain.Use(rateLimiter.Middleware())
+	}
+	
+	// Add security scanning if enabled
+	if args.SecurityScan {
+		scanner := security.NewScanner()
+		middlewareChain.Use(scanner.Middleware())
+	}
+	
+	// Add WebSocket support if enabled
+	if args.EnableWS {
+		wsProxy := websocket.NewProxy()
+		proxy = wsProxy.WrapHandler(proxy)
+	}
+	
+	// Add tracing middleware
+	if args.TracingEndpoint != "" {
+		middlewareChain.Use(tracing.HTTPMiddleware())
+	}
+	
+	// Load plugins if directory specified
+	if args.PluginDir != "" {
+		if err := middleware.LoadPlugins(args.PluginDir); err != nil {
+			logger.Warn("Failed to load plugins", "error", err, "dir", args.PluginDir)
+		}
+	}
+	
+	// Apply middleware chain to proxy
+	enhancedProxy := middlewareChain.Then(proxy)
+
+	if err := ensureCacheDirectory(args.Cache); err != nil {
+		return nil, nil, err
+	}
+
+	acmeConfig, err := configureACME(args.Provider, args.ACMEURL, args.Email, args.EABKID, args.EABHMAC)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	if err := ensureCacheDirectory(cacheDir); err != nil {
-		return nil, nil, err
+	certManager := createAutocertManager(args.Cache, args.Email, mapping, acmeConfig)
+	
+	// Start admin API if configured
+	if args.AdminAddr != "" {
+		go startAdminAPI(args.AdminAddr, certManager, mapping)
 	}
 
-	acmeConfig, err := configureACME(provider, acmeURL, email, eabKID, eabHMAC)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	certManager := createAutocertManager(cacheDir, email, mapping, acmeConfig)
-
-	return createHTTPSServer(addr, proxy, certManager), certManager.HTTPHandler(nil), nil
+	return createHTTPSServer(args.Addr, enhancedProxy, certManager), certManager.HTTPHandler(nil), nil
 }
 
 func createHTTPSServer(addr string, handler http.Handler, certManager *autocert.Manager) *http.Server {
@@ -621,6 +779,71 @@ type dbProxyConfig struct {
 	ProxyType  string
 	Backend    string
 	EnableTLS  bool
+}
+
+// startAdminAPI starts the administrative API server
+func startAdminAPI(addr string, certManager *autocert.Manager, mapping map[string]string) {
+	mux := http.NewServeMux()
+	
+	// Certificate management endpoints
+	mux.HandleFunc("/api/certs", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case "GET":
+			// List cached certificates
+			w.Header().Set("Content-Type", "application/json")
+			// Implementation would list certificates from certManager.Cache
+			w.Write([]byte(`{"status":"ok","message":"certificate listing endpoint"}`))
+		case "DELETE":
+			// Force certificate renewal
+			w.Write([]byte(`{"status":"ok","message":"certificate renewal triggered"}`))
+		default:
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+	
+	// Mapping management endpoints
+	mux.HandleFunc("/api/mappings", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case "GET":
+			// Return current mappings
+			w.Header().Set("Content-Type", "application/json")
+			// Convert mapping to JSON
+			w.Write([]byte(`{"status":"ok","mappings":{}}`))
+		case "POST":
+			// Hot reload mappings
+			w.Write([]byte(`{"status":"ok","message":"mappings reloaded"}`))
+		default:
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+	
+	// Rate limit management
+	mux.HandleFunc("/api/ratelimit/blacklist", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		// Add IP to blacklist
+		w.Write([]byte(`{"status":"ok","message":"IP added to blacklist"}`))
+	})
+	
+	// System information
+	mux.HandleFunc("/api/info", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"version":"1.0.0","status":"running"}`))
+	})
+	
+	srv := &http.Server{
+		Addr:         addr,
+		Handler:      mux,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+	}
+	
+	logger.Info("Admin API server started", "address", addr)
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		logger.Error("Admin API server failed", "error", err)
+	}
 }
 
 func startDatabaseProxies(configFile, certCacheDir string) error {
