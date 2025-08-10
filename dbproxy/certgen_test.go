@@ -42,8 +42,8 @@ func TestNewCertManager(t *testing.T) {
 			}
 
 			// Verify cache directory
-			if tt.cacheDir != "" && cm.cacheDir != tt.cacheDir {
-				t.Errorf("Expected cache dir %s, got %s", tt.cacheDir, cm.cacheDir)
+			if tt.cacheDir != "" && cm.CacheDir != tt.cacheDir {
+				t.Errorf("Expected cache dir %s, got %s", tt.cacheDir, cm.CacheDir)
 			}
 		})
 	}
@@ -400,7 +400,7 @@ func TestConcurrentCertificateGeneration(t *testing.T) {
 	}
 
 	// Verify only one certificate was created
-	certFile := filepath.Join(cm.cacheDir, hostname+".crt")
+	certFile := filepath.Join(cm.CacheDir, hostname+".crt")
 	if _, err := os.Stat(certFile); os.IsNotExist(err) {
 		t.Error("Certificate file not created")
 	}

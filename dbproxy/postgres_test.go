@@ -2,7 +2,6 @@ package dbproxy
 
 import (
 	"bytes"
-	"crypto/tls"
 	"net"
 	"testing"
 	"time"
