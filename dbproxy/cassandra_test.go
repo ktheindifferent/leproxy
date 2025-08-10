@@ -30,8 +30,8 @@ func TestNewCassandraProxy(t *testing.T) {
 			if proxy == nil {
 				t.Error("Expected non-nil proxy")
 			}
-			if proxy.backend != tt.backend {
-				t.Errorf("Expected backend %s, got %s", tt.backend, proxy.backend)
+			if proxy.Backend != tt.backend {
+				t.Errorf("Expected backend %s, got %s", tt.backend, proxy.Backend)
 			}
 		})
 	}
