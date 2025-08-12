@@ -4,10 +4,12 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/artyom/leproxy/internal/errors"
 	"github.com/artyom/leproxy/internal/logger"
@@ -17,24 +19,38 @@ import (
 
 // Config holds ACME configuration
 type Config struct {
-	Provider    string   // Provider name (letsencrypt, zerossl)
+	Provider    string   // Provider name (letsencrypt, zerossl, buypass, sslcom, entrust)
 	DirectoryURL string  // Custom ACME directory URL
 	Email       string   // Contact email
 	CacheDir    string   // Certificate cache directory
 	Domains     []string // Allowed domains
-	EABKID      string   // External Account Binding Key ID
-	EABHMAC     string   // External Account Binding HMAC
+	EABKID      string   // External Account Binding Key ID (required for some providers)
+	EABHMAC     string   // External Account Binding HMAC (required for some providers)
+	TestMode    bool     // Use staging/test environment when available
 }
 
 // Constants for ACME providers
 const (
+	// Provider names
 	ProviderLetsEncrypt = "letsencrypt"
 	ProviderZeroSSL     = "zerossl"
+	ProviderBuypass     = "buypass"
+	ProviderSSLcom      = "sslcom"
+	ProviderEntrust     = "entrust"
+	ProviderGoogle      = "google"
 	
-	// Default directory URLs
-	LetsEncryptStagingURL = "https://acme-staging-v02.api.letsencrypt.org/directory"
+	// Production directory URLs
 	LetsEncryptProdURL    = "https://acme-v02.api.letsencrypt.org/directory"
-	ZeroSSLURL           = "https://acme.zerossl.com/v2/DV90"
+	ZeroSSLProdURL        = "https://acme.zerossl.com/v2/DV90"
+	BuypassProdURL        = "https://api.buypass.com/acme/directory"
+	SSLcomProdURL         = "https://acme.ssl.com/sslcom-dv-rsa"
+	EntrustProdURL        = "https://acme.entrust.net/acme/api/v1/directory/ec"
+	GoogleProdURL         = "https://dv.acme-v02.api.pki.goog/directory"
+	
+	// Staging/Test directory URLs
+	LetsEncryptStagingURL = "https://acme-staging-v02.api.letsencrypt.org/directory"
+	BuypassStagingURL     = "https://api.test4.buypass.no/acme/directory"
+	GoogleStagingURL      = "https://dv.acme-v02.test-api.pki.goog/directory"
 )
 
 // Manager wraps autocert.Manager with additional functionality
@@ -106,8 +122,27 @@ func validateConfig(config *Config) error {
 		return fmt.Errorf("cache directory is required")
 	}
 
-	if config.Provider == ProviderZeroSSL && (config.EABKID == "" || config.EABHMAC == "") {
-		return fmt.Errorf("EAB credentials required for ZeroSSL")
+	// Validate provider-specific requirements
+	switch config.Provider {
+	case ProviderZeroSSL:
+		if config.EABKID == "" || config.EABHMAC == "" {
+			return fmt.Errorf("EAB credentials (EABKID and EABHMAC) are required for ZeroSSL")
+		}
+	case ProviderSSLcom:
+		if config.EABKID == "" || config.EABHMAC == "" {
+			return fmt.Errorf("EAB credentials (EABKID and EABHMAC) are required for SSL.com")
+		}
+	case ProviderGoogle:
+		if config.EABKID == "" || config.EABHMAC == "" {
+			return fmt.Errorf("EAB credentials (EABKID and EABHMAC) are required for Google Trust Services")
+		}
+	case ProviderBuypass:
+		// Buypass doesn't support wildcard certificates
+		for _, domain := range config.Domains {
+			if strings.HasPrefix(domain, "*.") {
+				return fmt.Errorf("Buypass does not support wildcard certificates (found: %s)", domain)
+			}
+		}
 	}
 
 	return nil
@@ -128,12 +163,17 @@ func configureACMEClient(manager *autocert.Manager, config *Config) error {
 
 		// Configure EAB if provided
 		if config.EABKID != "" && config.EABHMAC != "" {
-			logger.Info("Configuring External Account Binding")
+			logger.Info("Configuring External Account Binding", "provider", config.Provider)
 			// EAB configuration would be applied here during account registration
+			// Note: The actual EAB implementation requires modifying the account registration
+			// process which happens internally in autocert.Manager
 		}
 
 		manager.Client = client
-		logger.Info("ACME client configured", "directory", directoryURL)
+		logger.Info("ACME client configured", 
+			"provider", config.Provider,
+			"directory", directoryURL,
+			"test_mode", config.TestMode)
 	}
 
 	return nil
@@ -144,9 +184,34 @@ func getDirectoryURL(config *Config) string {
 		return config.DirectoryURL
 	}
 
-	switch strings.ToLower(config.Provider) {
+	provider := strings.ToLower(config.Provider)
+	
+	// Return staging URLs if test mode is enabled
+	if config.TestMode {
+		switch provider {
+		case ProviderLetsEncrypt:
+			return LetsEncryptStagingURL
+		case ProviderBuypass:
+			return BuypassStagingURL
+		case ProviderGoogle:
+			return GoogleStagingURL
+		default:
+			logger.Warn("No staging environment available for provider", "provider", provider)
+		}
+	}
+
+	// Return production URLs
+	switch provider {
 	case ProviderZeroSSL:
-		return ZeroSSLURL
+		return ZeroSSLProdURL
+	case ProviderBuypass:
+		return BuypassProdURL
+	case ProviderSSLcom:
+		return SSLcomProdURL
+	case ProviderEntrust:
+		return EntrustProdURL
+	case ProviderGoogle:
+		return GoogleProdURL
 	case ProviderLetsEncrypt:
 		return "" // Use default Let's Encrypt production
 	default:
@@ -248,4 +313,99 @@ func copyFile(src, dst string) error {
 
 	_, err = io.Copy(destination, source)
 	return err
+}
+
+// ProviderInfo contains information about an ACME provider
+type ProviderInfo struct {
+	Name            string
+	DisplayName     string
+	DirectoryURL    string
+	StagingURL      string
+	RequiresEAB     bool
+	SupportsWildcard bool
+	CertValidity    int // days
+	Description     string
+}
+
+// GetProviderInfo returns information about a specific ACME provider
+func GetProviderInfo(provider string) *ProviderInfo {
+	providers := map[string]*ProviderInfo{
+		ProviderLetsEncrypt: {
+			Name:            ProviderLetsEncrypt,
+			DisplayName:     "Let's Encrypt",
+			DirectoryURL:    LetsEncryptProdURL,
+			StagingURL:      LetsEncryptStagingURL,
+			RequiresEAB:     false,
+			SupportsWildcard: true,
+			CertValidity:    90,
+			Description:     "The original free ACME CA, widely trusted and supported",
+		},
+		ProviderZeroSSL: {
+			Name:            ProviderZeroSSL,
+			DisplayName:     "ZeroSSL",
+			DirectoryURL:    ZeroSSLProdURL,
+			StagingURL:      "",
+			RequiresEAB:     true,
+			SupportsWildcard: true,
+			CertValidity:    90,
+			Description:     "Free ACME certificates with EAB, supports wildcards",
+		},
+		ProviderBuypass: {
+			Name:            ProviderBuypass,
+			DisplayName:     "Buypass Go SSL",
+			DirectoryURL:    BuypassProdURL,
+			StagingURL:      BuypassStagingURL,
+			RequiresEAB:     false,
+			SupportsWildcard: false,
+			CertValidity:    180,
+			Description:     "European CA with 180-day certificates, no wildcard support",
+		},
+		ProviderSSLcom: {
+			Name:            ProviderSSLcom,
+			DisplayName:     "SSL.com",
+			DirectoryURL:    SSLcomProdURL,
+			StagingURL:      "",
+			RequiresEAB:     true,
+			SupportsWildcard: false,
+			CertValidity:    90,
+			Description:     "Commercial CA with free ACME tier, single domain + www",
+		},
+		ProviderEntrust: {
+			Name:            ProviderEntrust,
+			DisplayName:     "Entrust",
+			DirectoryURL:    EntrustProdURL,
+			StagingURL:      "",
+			RequiresEAB:     false,
+			SupportsWildcard: true,
+			CertValidity:    90,
+			Description:     "Enterprise-grade CA with ACME support",
+		},
+		ProviderGoogle: {
+			Name:            ProviderGoogle,
+			DisplayName:     "Google Trust Services",
+			DirectoryURL:    GoogleProdURL,
+			StagingURL:      GoogleStagingURL,
+			RequiresEAB:     true,
+			SupportsWildcard: true,
+			CertValidity:    90,
+			Description:     "Google's public CA with ACME support, requires EAB",
+		},
+	}
+	
+	if info, exists := providers[strings.ToLower(provider)]; exists {
+		return info
+	}
+	return nil
+}
+
+// GetAvailableProviders returns a list of all available ACME providers
+func GetAvailableProviders() []ProviderInfo {
+	return []ProviderInfo{
+		*GetProviderInfo(ProviderLetsEncrypt),
+		*GetProviderInfo(ProviderZeroSSL),
+		*GetProviderInfo(ProviderBuypass),
+		*GetProviderInfo(ProviderSSLcom),
+		*GetProviderInfo(ProviderEntrust),
+		*GetProviderInfo(ProviderGoogle),
+	}
 }
