@@ -83,10 +83,11 @@ type runArgs struct {
 	HTTP     string `flag:"http,optional address to serve http-to-https redirects and ACME http-01 challenge responses"` // HTTP redirect address
 	
 	// ACME provider configuration
-	Provider string `flag:"provider,ACME provider to use (letsencrypt or zerossl, default: letsencrypt)"` // ACME provider selection
+	Provider string `flag:"provider,ACME provider: letsencrypt, zerossl, buypass, sslcom, entrust, google (default: letsencrypt)"` // ACME provider selection
 	ACMEURL  string `flag:"acme-url,custom ACME directory URL (overrides provider)"` // Custom ACME server URL
-	EABKID   string `flag:"eab-kid,EAB Key ID for ZeroSSL (required for ZeroSSL)"`  // External Account Binding Key ID
-	EABHMAC  string `flag:"eab-hmac,EAB HMAC key for ZeroSSL (required for ZeroSSL)"` // External Account Binding HMAC key
+	EABKID   string `flag:"eab-kid,EAB Key ID (required for zerossl, sslcom, google)"`  // External Account Binding Key ID
+	EABHMAC  string `flag:"eab-hmac,EAB HMAC key (required for zerossl, sslcom, google)"` // External Account Binding HMAC key
+	TestMode bool   `flag:"test-mode,use staging/test environment when available (default: false)"` // Use staging environment
 
 	// Connection timeout configuration
 	RTo  time.Duration `flag:"rto,maximum duration before timing out read of the request"`   // Read timeout
@@ -363,7 +364,7 @@ func setupServerWithEnhancements(args runArgs) (*http.Server, http.Handler, erro
 		return nil, nil, err
 	}
 
-	acmeConfig, err := configureACME(args.Provider, args.ACMEURL, args.Email, args.EABKID, args.EABHMAC)
+	acmeConfig, err := configureACME(args.Provider, args.ACMEURL, args.Email, args.EABKID, args.EABHMAC, args.TestMode)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -411,59 +412,84 @@ type acmeConfiguration struct {
 	provider     string
 	eabKID       string
 	eabHMAC      string
+	testMode     bool
 }
 
-func configureACME(provider, acmeURL, email, eabKID, eabHMAC string) (*acmeConfiguration, error) {
+func configureACME(provider, acmeURL, email, eabKID, eabHMAC string, testMode bool) (*acmeConfiguration, error) {
 	config := &acmeConfiguration{
 		provider: provider,
 		eabKID:   eabKID,
 		eabHMAC:  eabHMAC,
+		testMode: testMode,
 	}
 	
 	if acmeURL != "" {
 		config.directoryURL = acmeURL
 	} else {
-		url, err := getProviderURL(provider)
+		url, err := getProviderURL(provider, testMode)
 		if err != nil {
 			return nil, err
 		}
 		config.directoryURL = url
 	}
 	
-	if err := validateZeroSSLConfig(provider, email, eabKID, eabHMAC); err != nil {
+	if err := validateProviderConfig(provider, email, eabKID, eabHMAC); err != nil {
 		return nil, err
 	}
 	
 	return config, nil
 }
 
-func getProviderURL(provider string) (string, error) {
+func getProviderURL(provider string, testMode bool) (string, error) {
+	// Handle test mode for providers with staging environments
+	if testMode {
+		testProviderURLs := map[string]string{
+			"letsencrypt": "https://acme-staging-v02.api.letsencrypt.org/directory",
+			"buypass":     "https://api.test4.buypass.no/acme/directory",
+			"google":      "https://dv.acme-v02.test-api.pki.goog/directory",
+		}
+		
+		if testURL, hasTest := testProviderURLs[provider]; hasTest {
+			log.Printf("Using %s staging/test environment", provider)
+			return testURL, nil
+		}
+	}
+	
+	// Production URLs
 	providerURLs := map[string]string{
-		"":                    "https://acme-v02.api.letsencrypt.org/directory",
-		"letsencrypt":         "https://acme-v02.api.letsencrypt.org/directory",
-		"letsencrypt-staging": "https://acme-staging-v02.api.letsencrypt.org/directory",
-		"zerossl":             "https://acme.zerossl.com/v2/DV90",
+		"":            "https://acme-v02.api.letsencrypt.org/directory",
+		"letsencrypt": "https://acme-v02.api.letsencrypt.org/directory",
+		"zerossl":     "https://acme.zerossl.com/v2/DV90",
+		"buypass":     "https://api.buypass.com/acme/directory",
+		"sslcom":      "https://acme.ssl.com/sslcom-dv-rsa",
+		"entrust":     "https://acme.entrust.net/acme/api/v1/directory/ec",
+		"google":      "https://dv.acme-v02.api.pki.goog/directory",
 	}
 	
 	url, ok := providerURLs[provider]
 	if !ok {
-		return "", fmt.Errorf("unknown provider %q, use 'letsencrypt', 'zerossl', or specify --acme-url", provider)
+		return "", fmt.Errorf("unknown provider %q, use one of: letsencrypt, zerossl, buypass, sslcom, entrust, google, or specify --acme-url", provider)
 	}
 	
 	return url, nil
 }
 
-func validateZeroSSLConfig(provider, email, eabKID, eabHMAC string) error {
-	if provider != "zerossl" {
-		return nil
+func validateProviderConfig(provider, email, eabKID, eabHMAC string) error {
+	// Check providers that require EAB
+	eabRequiredProviders := map[string]string{
+		"zerossl": "https://app.zerossl.com/developer",
+		"sslcom":  "https://www.ssl.com/",
+		"google":  "https://cloud.google.com/certificate-manager/docs/public-ca-tutorial",
 	}
 	
-	if email == "" {
-		return fmt.Errorf("email is required when using ZeroSSL provider")
-	}
-	
-	if eabKID == "" || eabHMAC == "" {
-		return fmt.Errorf("EAB credentials (--eab-kid and --eab-hmac) are required for ZeroSSL. Get them from https://app.zerossl.com/developer")
+	if helpURL, requiresEAB := eabRequiredProviders[provider]; requiresEAB {
+		if email == "" {
+			return fmt.Errorf("email is required when using %s provider", provider)
+		}
+		
+		if eabKID == "" || eabHMAC == "" {
+			return fmt.Errorf("EAB credentials (--eab-kid and --eab-hmac) are required for %s. Get them from %s", provider, helpURL)
+		}
 	}
 	
 	return nil
@@ -483,8 +509,13 @@ func createAutocertManager(cacheDir, email string, mapping map[string]string, co
 			DirectoryURL: config.directoryURL,
 		}
 		
-		if config.provider == "zerossl" && config.eabKID != "" && config.eabHMAC != "" {
-			configureZeroSSLClient(client, email, config.eabKID, config.eabHMAC)
+		// Configure EAB for providers that require it
+		eabProviders := []string{"zerossl", "sslcom", "google"}
+		for _, p := range eabProviders {
+			if config.provider == p && config.eabKID != "" && config.eabHMAC != "" {
+				configureEABClient(client, email, config.eabKID, config.eabHMAC, config.provider)
+				break
+			}
 		}
 		
 		m.Client = client
@@ -493,10 +524,10 @@ func createAutocertManager(cacheDir, email string, mapping map[string]string, co
 	return m
 }
 
-func configureZeroSSLClient(client *acme.Client, email, eabKID, eabHMAC string) {
+func configureEABClient(client *acme.Client, email, eabKID, eabHMAC, provider string) {
 	ctx := context.Background()
 	_, _ = client.Discover(ctx)
-	log.Printf("Configuring ZeroSSL with EAB credentials (KID: %s)", eabKID)
+	log.Printf("Configuring %s with EAB credentials (KID: %s)", provider, eabKID)
 }
 
 func setProxy(mapping map[string]string) (http.Handler, error) {

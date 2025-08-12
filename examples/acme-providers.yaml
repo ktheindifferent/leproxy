@@ -1,0 +1,192 @@
+# Example ACME Provider Configurations for LeProxy
+# This file demonstrates how to configure different ACME providers
+
+# ============================================================================
+# Let's Encrypt (Default - Most Popular)
+# ============================================================================
+# - Free DV certificates
+# - 90-day validity
+# - Supports wildcards
+# - No EAB required
+# - Has staging environment for testing
+
+letsencrypt_config:
+  server:
+    http_addr: ":80"
+    https_addr: ":443"
+    acme:
+      provider: letsencrypt
+      email: admin@example.com
+      cache_dir: /var/cache/letsencrypt
+      test_mode: false  # Set to true to use staging
+      domains:
+        - example.com
+        - "*.example.com"  # Wildcard supported
+
+# ============================================================================
+# ZeroSSL
+# ============================================================================
+# - Free DV certificates via ACME
+# - 90-day validity
+# - Supports wildcards
+# - Requires EAB credentials (free registration)
+# - Get credentials from: https://app.zerossl.com/developer
+
+zerossl_config:
+  server:
+    http_addr: ":80"
+    https_addr: ":443"
+    acme:
+      provider: zerossl
+      email: admin@example.com
+      cache_dir: /var/cache/zerossl
+      eab_kid: "YOUR_ZEROSSL_EAB_KID"      # Required
+      eab_hmac: "YOUR_ZEROSSL_EAB_HMAC"    # Required
+      domains:
+        - example.com
+        - "*.example.com"  # Wildcard supported
+
+# ============================================================================
+# Buypass Go SSL
+# ============================================================================
+# - European CA (Norway)
+# - Free DV certificates
+# - 180-day validity (2x longer than others!)
+# - Does NOT support wildcards
+# - No EAB required
+# - Has test environment
+
+buypass_config:
+  server:
+    http_addr: ":80"
+    https_addr: ":443"
+    acme:
+      provider: buypass
+      email: admin@example.com
+      cache_dir: /var/cache/buypass
+      test_mode: false  # Set to true for test environment
+      domains:
+        - example.com
+        - www.example.com     # Must list each subdomain explicitly
+        - api.example.com     # No wildcard support
+        - shop.example.com
+
+# ============================================================================
+# SSL.com
+# ============================================================================
+# - Commercial CA with free ACME tier
+# - 90-day validity
+# - Limited to single domain + www
+# - Requires EAB credentials
+# - Get credentials from: https://www.ssl.com/
+
+sslcom_config:
+  server:
+    http_addr: ":80"
+    https_addr: ":443"
+    acme:
+      provider: sslcom
+      email: admin@example.com
+      cache_dir: /var/cache/sslcom
+      eab_kid: "YOUR_SSLCOM_EAB_KID"      # Required
+      eab_hmac: "YOUR_SSLCOM_EAB_HMAC"    # Required
+      domains:
+        - example.com
+        - www.example.com  # Limited to main domain + www
+
+# ============================================================================
+# Entrust
+# ============================================================================
+# - Enterprise-grade CA
+# - 90-day validity
+# - Supports wildcards
+# - No EAB required for basic ACME
+
+entrust_config:
+  server:
+    http_addr: ":80"
+    https_addr: ":443"
+    acme:
+      provider: entrust
+      email: admin@example.com
+      cache_dir: /var/cache/entrust
+      domains:
+        - example.com
+        - "*.example.com"  # Wildcard supported
+
+# ============================================================================
+# Google Trust Services
+# ============================================================================
+# - Google's public CA
+# - 90-day validity
+# - Supports wildcards
+# - Requires EAB credentials
+# - Has test environment
+# - Get credentials from: https://cloud.google.com/certificate-manager/docs/public-ca-tutorial
+
+google_config:
+  server:
+    http_addr: ":80"
+    https_addr: ":443"
+    acme:
+      provider: google
+      email: admin@example.com
+      cache_dir: /var/cache/google
+      test_mode: false  # Set to true for test environment
+      eab_kid: "YOUR_GOOGLE_EAB_KID"      # Required
+      eab_hmac: "YOUR_GOOGLE_EAB_HMAC"    # Required
+      domains:
+        - example.com
+        - "*.example.com"  # Wildcard supported
+
+# ============================================================================
+# Custom ACME Server
+# ============================================================================
+# You can also specify a custom ACME directory URL
+# This overrides the provider selection
+
+custom_acme_config:
+  server:
+    http_addr: ":80"
+    https_addr: ":443"
+    acme:
+      directory_url: "https://your-custom-acme-server.com/directory"
+      email: admin@example.com
+      cache_dir: /var/cache/custom
+      # Add EAB if required by your custom server
+      # eab_kid: "YOUR_CUSTOM_EAB_KID"
+      # eab_hmac: "YOUR_CUSTOM_EAB_HMAC"
+      domains:
+        - example.com
+
+# ============================================================================
+# Provider Selection Guidelines
+# ============================================================================
+# 
+# Choose Let's Encrypt if:
+# - You want the most widely supported and tested option
+# - You need wildcard certificates
+# - You don't want to manage EAB credentials
+# 
+# Choose ZeroSSL if:
+# - You want an alternative to Let's Encrypt
+# - You need wildcard certificates
+# - You're okay with managing EAB credentials
+# 
+# Choose Buypass if:
+# - You need longer certificate validity (180 days)
+# - You're in Europe and prefer a European CA
+# - You don't need wildcard certificates
+# 
+# Choose SSL.com if:
+# - You only need a single domain + www
+# - You want a commercial CA backing
+# 
+# Choose Entrust if:
+# - You need enterprise-grade support
+# - You want a well-established commercial CA
+# 
+# Choose Google if:
+# - You're already using Google Cloud
+# - You want Google's infrastructure and reliability
+# - You're okay with managing EAB credentials

@@ -52,16 +52,21 @@ type ServerConfig struct {
 }
 
 type ACMEConfig struct {
-	Provider  string `yaml:"provider" json:"provider" default:"letsencrypt" enum:"letsencrypt,zerossl,letsencrypt-staging"`
+	Provider  string `yaml:"provider" json:"provider" default:"letsencrypt" enum:"letsencrypt,zerossl,buypass,sslcom,entrust,google"`
 	Email     string `yaml:"email" json:"email" required:"true"`
 	CacheDir  string `yaml:"cache_dir" json:"cache_dir" default:"/var/cache/letsencrypt"`
+	TestMode  bool   `yaml:"test_mode" json:"test_mode" default:"false"` // Use staging environment when available
 	
-	// ZeroSSL specific
+	// External Account Binding (required for some providers)
 	EABKID  string `yaml:"eab_kid" json:"eab_kid"`
 	EABHMAC string `yaml:"eab_hmac" json:"eab_hmac"`
 	
-	// Custom ACME server
+	// Custom ACME server (overrides provider selection)
 	DirectoryURL string `yaml:"directory_url" json:"directory_url"`
+	
+	// Advanced options
+	Domains           []string `yaml:"domains" json:"domains"`           // Allowed domains for certificate requests
+	RenewBeforeDays   int      `yaml:"renew_before_days" json:"renew_before_days" default:"30"` // Renew certificates X days before expiry
 }
 
 type BackendConfig struct {
@@ -256,9 +261,18 @@ func (c *Config) Validate() error {
 		errors = append(errors, "ACME email is required when provider is set")
 	}
 	
-	if c.Server.ACME.Provider == "zerossl" {
+	// Validate provider-specific requirements
+	switch c.Server.ACME.Provider {
+	case "zerossl", "sslcom", "google":
 		if c.Server.ACME.EABKID == "" || c.Server.ACME.EABHMAC == "" {
-			errors = append(errors, "EAB credentials are required for ZeroSSL")
+			errors = append(errors, fmt.Sprintf("EAB credentials (eab_kid and eab_hmac) are required for %s", c.Server.ACME.Provider))
+		}
+	case "buypass":
+		// Check for wildcard domains which Buypass doesn't support
+		for _, domain := range c.Server.ACME.Domains {
+			if strings.HasPrefix(domain, "*.") {
+				errors = append(errors, fmt.Sprintf("Buypass does not support wildcard certificates (found: %s)", domain))
+			}
 		}
 	}
 	
