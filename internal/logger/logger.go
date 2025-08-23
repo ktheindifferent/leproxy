@@ -154,10 +154,6 @@ func (l *Logger) log(level Level, msg string, fields map[string]interface{}) {
 	}
 
 	fmt.Fprint(output, out)
-
-	if level == LevelFatal {
-		os.Exit(1)
-	}
 }
 
 func Debug(msg string, fields ...map[string]interface{}) {
@@ -240,4 +236,15 @@ func mergeFields(fields ...map[string]interface{}) map[string]interface{} {
 		}
 	}
 	return result
+}
+
+// Init initializes the logger with the specified level and JSON mode
+func Init(levelStr string, jsonMode bool) error {
+	level, err := ParseLevel(levelStr)
+	if err != nil {
+		return err
+	}
+	SetLevel(level)
+	SetJSONMode(jsonMode)
+	return nil
 }

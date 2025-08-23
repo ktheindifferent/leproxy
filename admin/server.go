@@ -307,7 +307,7 @@ func getConfigPath(envVar, defaultFile string) string {
 	return filePath
 }
 
-func main() {
+func run() error {
 	httpMappingFile := getConfigPath("LEPROXY_HTTP_CONFIG", "mapping.yml")
 	dbMappingFile := getConfigPath("LEPROXY_DB_CONFIG", "dbproxy_config.yml")
 
@@ -342,7 +342,16 @@ func main() {
 	}
 	
 	if err := http.ListenAndServe(port, mux); err != nil {
-		log.Fatal(err)
+		log.Printf("Admin server failed: %v", err)
+		return err
+	}
+	return nil
+}
+
+func main() {
+	if err := run(); err != nil {
+		log.Printf("Error starting admin server: %v", err)
+		os.Exit(1)
 	}
 }
 
