@@ -428,7 +428,10 @@ func TestPoolIdleTimeout(t *testing.T) {
 	
 	// Get and return a connection
 	conn, _ := pool.Get(ctx)
-	mc1 := conn.(*mockConn)
+	mc1, ok := conn.(*mockConn)
+	if !ok {
+		t.Fatal("Expected connection to be *mockConn")
+	}
 	pool.Put(conn)
 	
 	// Wait for idle timeout
@@ -436,7 +439,10 @@ func TestPoolIdleTimeout(t *testing.T) {
 	
 	// Get a connection - should be a new one
 	conn2, _ := pool.Get(ctx)
-	mc2 := conn2.(*mockConn)
+	mc2, ok := conn2.(*mockConn)
+	if !ok {
+		t.Fatal("Expected connection to be *mockConn")
+	}
 	
 	if mc1.id == mc2.id {
 		t.Error("Should have gotten a new connection after idle timeout")
