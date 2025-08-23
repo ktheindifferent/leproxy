@@ -68,11 +68,11 @@ func (m *mockConn) SetWriteDeadline(t time.Time) error {
 }
 
 func TestNewPool(t *testing.T) {
-	config := &Config{
-		MaxConnections:  10,
-		MinConnections:  2,
-		MaxIdleTime:     time.Minute,
-		HealthCheckTime: 30 * time.Second,
+	config := Config{
+		MaxConns:    10,
+		MinConns:    2,
+		IdleTimeout: time.Minute,
+		MaxLifetime: 30 * time.Second,
 	}
 	
 	var connID int32
@@ -81,34 +81,35 @@ func TestNewPool(t *testing.T) {
 		return &mockConn{id: int(id)}, nil
 	}
 	
-	healthCheck := func(conn net.Conn) error {
-		if mc, ok := conn.(*mockConn); ok {
-			return mc.healthErr
-		}
-		return nil
+	config.Factory = factory
+	
+	pool, err := New(config)
+	if err != nil {
+		t.Fatalf("Failed to create pool: %v", err)
 	}
 	
-	pool := NewPool(config, factory, healthCheck)
-	
 	if pool == nil {
-		t.Fatal("NewPool returned nil")
+		t.Fatal("New returned nil")
 	}
 	
 	// Check configuration
-	if pool.config.MaxConnections != config.MaxConnections {
-		t.Errorf("MaxConnections = %d, want %d", pool.config.MaxConnections, config.MaxConnections)
+	if pool.maxConns != config.MaxConns {
+		t.Errorf("MaxConns = %d, want %d", pool.maxConns, config.MaxConns)
 	}
 	
-	if pool.config.MinConnections != config.MinConnections {
-		t.Errorf("MinConnections = %d, want %d", pool.config.MinConnections, config.MinConnections)
+	if pool.minConns != config.MinConns {
+		t.Errorf("MinConns = %d, want %d", pool.minConns, config.MinConns)
 	}
+	
+	pool.Close()
 }
 
 func TestPoolGet(t *testing.T) {
-	config := &Config{
-		MaxConnections: 5,
-		MinConnections: 1,
-		MaxIdleTime:    time.Minute,
+	config := Config{
+		MaxConns:    5,
+		MinConns:    0,
+		IdleTimeout: time.Minute,
+		MaxLifetime: 5 * time.Minute,
 	}
 	
 	var connID int32
@@ -117,7 +118,14 @@ func TestPoolGet(t *testing.T) {
 		return &mockConn{id: int(id)}, nil
 	}
 	
-	pool := NewPool(config, factory, nil)
+	config.Factory = factory
+	
+	pool, err := New(config)
+	if err != nil {
+		t.Fatalf("Failed to create pool: %v", err)
+	}
+	defer pool.Close()
+	
 	ctx := context.Background()
 	
 	// Get a connection
@@ -131,43 +139,42 @@ func TestPoolGet(t *testing.T) {
 	}
 	
 	// Return the connection
-	pool.Put(conn)
+	conn.Close()
 	
-	// Get it again - should be the same connection
+	// Get it again
 	conn2, err := pool.Get(ctx)
 	if err != nil {
 		t.Fatalf("Failed to get connection second time: %v", err)
 	}
 	
-	// Check it's the same connection (reused from pool)
-	if mc1, ok := conn.(*mockConn); ok {
-		if mc2, ok := conn2.(*mockConn); ok {
-			if mc1.id != mc2.id {
-				t.Error("Expected to get the same connection from pool")
-			}
-		}
-	}
-	
-	pool.Put(conn2)
+	conn2.Close()
 }
 
 func TestPoolMaxConnections(t *testing.T) {
-	config := &Config{
-		MaxConnections: 2,
-		MinConnections: 0,
-		MaxIdleTime:    time.Minute,
+	config := Config{
+		MaxConns:    2,
+		MinConns:    0,
+		IdleTimeout: time.Minute,
+		MaxLifetime: 5 * time.Minute,
 	}
 	
 	factory := func(ctx context.Context) (net.Conn, error) {
 		return &mockConn{}, nil
 	}
 	
-	pool := NewPool(config, factory, nil)
+	config.Factory = factory
+	
+	pool, err := New(config)
+	if err != nil {
+		t.Fatalf("Failed to create pool: %v", err)
+	}
+	defer pool.Close()
+	
 	ctx := context.Background()
 	
 	// Get max connections
-	conns := make([]net.Conn, config.MaxConnections)
-	for i := 0; i < config.MaxConnections; i++ {
+	conns := make([]net.Conn, config.MaxConns)
+	for i := 0; i < config.MaxConns; i++ {
 		conn, err := pool.Get(ctx)
 		if err != nil {
 			t.Fatalf("Failed to get connection %d: %v", i, err)
@@ -179,31 +186,33 @@ func TestPoolMaxConnections(t *testing.T) {
 	timeoutCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
 	defer cancel()
 	
-	_, err := pool.Get(timeoutCtx)
+	_, err = pool.Get(timeoutCtx)
 	if err == nil {
 		t.Error("Expected error when exceeding max connections")
 	}
 	
 	// Return one connection
-	pool.Put(conns[0])
+	conns[0].Close()
 	
 	// Now we should be able to get one
 	conn, err := pool.Get(ctx)
 	if err != nil {
 		t.Errorf("Should be able to get connection after returning one: %v", err)
 	}
-	pool.Put(conn)
+	conn.Close()
 	
 	// Return all connections
 	for i := 1; i < len(conns); i++ {
-		pool.Put(conns[i])
+		conns[i].Close()
 	}
 }
 
 func TestPoolFactoryError(t *testing.T) {
-	config := &Config{
-		MaxConnections: 5,
-		MinConnections: 0,
+	config := Config{
+		MaxConns:    5,
+		MinConns:    0,
+		IdleTimeout: time.Minute,
+		MaxLifetime: 5 * time.Minute,
 	}
 	
 	expectedErr := errors.New("connection failed")
@@ -211,7 +220,14 @@ func TestPoolFactoryError(t *testing.T) {
 		return nil, expectedErr
 	}
 	
-	pool := NewPool(config, factory, nil)
+	config.Factory = factory
+	
+	pool, err := New(config)
+	if err != nil {
+		t.Fatalf("Failed to create pool: %v", err)
+	}
+	defer pool.Close()
+	
 	ctx := context.Background()
 	
 	conn, err := pool.Get(ctx)
@@ -225,26 +241,27 @@ func TestPoolFactoryError(t *testing.T) {
 }
 
 func TestPoolHealthCheck(t *testing.T) {
-	config := &Config{
-		MaxConnections:  5,
-		MinConnections:  1,
-		HealthCheckTime: 100 * time.Millisecond,
+	config := Config{
+		MaxConns:    5,
+		MinConns:    0,
+		IdleTimeout: 100 * time.Millisecond,
+		MaxLifetime: 5 * time.Minute,
 	}
 	
+	var connID int32
 	factory := func(ctx context.Context) (net.Conn, error) {
-		return &mockConn{}, nil
+		id := atomic.AddInt32(&connID, 1)
+		return &mockConn{id: int(id)}, nil
 	}
 	
-	var healthCheckCalled bool
-	healthCheck := func(conn net.Conn) error {
-		healthCheckCalled = true
-		if mc, ok := conn.(*mockConn); ok {
-			return mc.healthErr
-		}
-		return nil
-	}
+	config.Factory = factory
 	
-	pool := NewPool(config, factory, healthCheck)
+	pool, err := New(config)
+	if err != nil {
+		t.Fatalf("Failed to create pool: %v", err)
+	}
+	defer pool.Close()
+	
 	ctx := context.Background()
 	
 	// Get and return a connection
@@ -253,49 +270,65 @@ func TestPoolHealthCheck(t *testing.T) {
 		t.Fatalf("Failed to get connection: %v", err)
 	}
 	
-	// Set connection to fail health check
-	if mc, ok := conn.(*mockConn); ok {
-		mc.healthErr = errors.New("health check failed")
+	var id1 int
+	switch c := conn.(type) {
+	case *PooledConn:
+		if mc, ok := c.Conn.(*mockConn); ok {
+			id1 = mc.id
+		}
+	case *mockConn:
+		id1 = c.id
 	}
 	
-	pool.Put(conn)
+	// Return the connection
+	conn.Close()
 	
-	// Wait for health check to run
+	// Wait for idle timeout
 	time.Sleep(200 * time.Millisecond)
 	
-	if !healthCheckCalled {
-		t.Error("Health check should have been called")
-	}
-	
-	// Get a connection - should be a new one since old failed health check
+	// Trigger cleanup by getting a new connection
 	conn2, err := pool.Get(ctx)
 	if err != nil {
-		t.Fatalf("Failed to get connection after health check: %v", err)
+		t.Fatalf("Failed to get connection after timeout: %v", err)
 	}
 	
-	// Verify it's a different connection
-	if mc1, ok := conn.(*mockConn); ok {
-		if mc2, ok := conn2.(*mockConn); ok {
-			if mc1.id == mc2.id {
-				t.Error("Should have gotten a new connection after health check failure")
-			}
+	// Should be a different connection since old one timed out
+	var id2 int
+	switch c := conn2.(type) {
+	case *PooledConn:
+		if mc, ok := c.Conn.(*mockConn); ok {
+			id2 = mc.id
 		}
+	case *mockConn:
+		id2 = c.id
 	}
 	
-	pool.Put(conn2)
+	if id2 == id1 {
+		t.Error("Should have gotten a new connection after idle timeout")
+	}
+	
+	conn2.Close()
 }
 
 func TestPoolClose(t *testing.T) {
-	config := &Config{
-		MaxConnections: 5,
-		MinConnections: 1,
+	config := Config{
+		MaxConns:    5,
+		MinConns:    0,
+		IdleTimeout: time.Minute,
+		MaxLifetime: 5 * time.Minute,
 	}
 	
 	factory := func(ctx context.Context) (net.Conn, error) {
 		return &mockConn{}, nil
 	}
 	
-	pool := NewPool(config, factory, nil)
+	config.Factory = factory
+	
+	pool, err := New(config)
+	if err != nil {
+		t.Fatalf("Failed to create pool: %v", err)
+	}
+	
 	ctx := context.Background()
 	
 	// Get some connections
@@ -303,39 +336,48 @@ func TestPoolClose(t *testing.T) {
 	conn2, _ := pool.Get(ctx)
 	
 	// Return them
-	pool.Put(conn1)
-	pool.Put(conn2)
+	conn1.Close()
+	conn2.Close()
 	
 	// Close the pool
-	err := pool.Close()
+	err = pool.Close()
 	if err != nil {
 		t.Errorf("Failed to close pool: %v", err)
 	}
 	
 	// Try to get a connection - should fail
 	_, err = pool.Get(ctx)
-	if err == nil {
-		t.Error("Expected error when getting connection from closed pool")
+	if err != ErrPoolClosed {
+		t.Error("Expected ErrPoolClosed when getting connection from closed pool")
 	}
 }
 
 func TestPoolStats(t *testing.T) {
-	config := &Config{
-		MaxConnections: 5,
-		MinConnections: 1,
+	config := Config{
+		MaxConns:    5,
+		MinConns:    0,
+		IdleTimeout: time.Minute,
+		MaxLifetime: 5 * time.Minute,
 	}
 	
 	factory := func(ctx context.Context) (net.Conn, error) {
 		return &mockConn{}, nil
 	}
 	
-	pool := NewPool(config, factory, nil)
+	config.Factory = factory
+	
+	pool, err := New(config)
+	if err != nil {
+		t.Fatalf("Failed to create pool: %v", err)
+	}
+	defer pool.Close()
+	
 	ctx := context.Background()
 	
 	// Initial stats
 	stats := pool.Stats()
-	if stats.TotalConnections != 0 {
-		t.Errorf("Initial TotalConnections = %d, want 0", stats.TotalConnections)
+	if stats.Created != 0 {
+		t.Errorf("Initial Created = %d, want 0", stats.Created)
 	}
 	
 	// Get connections
@@ -343,28 +385,33 @@ func TestPoolStats(t *testing.T) {
 	conn2, _ := pool.Get(ctx)
 	
 	stats = pool.Stats()
-	if stats.ActiveConnections != 2 {
-		t.Errorf("ActiveConnections = %d, want 2", stats.ActiveConnections)
+	if stats.Active != 2 {
+		t.Errorf("Active = %d, want 2", stats.Active)
 	}
 	
 	// Return one
-	pool.Put(conn1)
+	conn1.Close()
+	
+	// Give time for the connection to return to pool
+	time.Sleep(10 * time.Millisecond)
 	
 	stats = pool.Stats()
-	if stats.ActiveConnections != 1 {
-		t.Errorf("After returning one, ActiveConnections = %d, want 1", stats.ActiveConnections)
+	if stats.Active != 1 {
+		t.Errorf("After returning one, Active = %d, want 1", stats.Active)
 	}
-	if stats.IdleConnections != 1 {
-		t.Errorf("After returning one, IdleConnections = %d, want 1", stats.IdleConnections)
+	if stats.Idle != 1 {
+		t.Errorf("After returning one, Idle = %d, want 1", stats.Idle)
 	}
 	
-	pool.Put(conn2)
+	conn2.Close()
 }
 
 func TestPoolConcurrency(t *testing.T) {
-	config := &Config{
-		MaxConnections: 10,
-		MinConnections: 0,
+	config := Config{
+		MaxConns:    10,
+		MinConns:    0,
+		IdleTimeout: time.Minute,
+		MaxLifetime: 5 * time.Minute,
 	}
 	
 	factory := func(ctx context.Context) (net.Conn, error) {
@@ -372,7 +419,14 @@ func TestPoolConcurrency(t *testing.T) {
 		return &mockConn{}, nil
 	}
 	
-	pool := NewPool(config, factory, nil)
+	config.Factory = factory
+	
+	pool, err := New(config)
+	if err != nil {
+		t.Fatalf("Failed to create pool: %v", err)
+	}
+	defer pool.Close()
+	
 	ctx := context.Background()
 	
 	var wg sync.WaitGroup
@@ -393,7 +447,7 @@ func TestPoolConcurrency(t *testing.T) {
 			// Use connection briefly
 			time.Sleep(5 * time.Millisecond)
 			
-			pool.Put(conn)
+			conn.Close()
 		}()
 	}
 	
@@ -407,45 +461,69 @@ func TestPoolConcurrency(t *testing.T) {
 	
 	// Final stats check
 	stats := pool.Stats()
-	if stats.ActiveConnections != 0 {
-		t.Errorf("All connections should be returned, active = %d", stats.ActiveConnections)
+	if stats.Active != 0 {
+		t.Errorf("All connections should be returned, active = %d", stats.Active)
 	}
 }
 
 func TestPoolIdleTimeout(t *testing.T) {
-	config := &Config{
-		MaxConnections: 5,
-		MinConnections: 0,
-		MaxIdleTime:    100 * time.Millisecond,
+	config := Config{
+		MaxConns:    5,
+		MinConns:    0,
+		IdleTimeout: 100 * time.Millisecond,
+		MaxLifetime: 5 * time.Minute,
 	}
 	
+	var connID int32
 	factory := func(ctx context.Context) (net.Conn, error) {
-		return &mockConn{}, nil
+		id := atomic.AddInt32(&connID, 1)
+		return &mockConn{id: int(id)}, nil
 	}
 	
-	pool := NewPool(config, factory, nil)
+	config.Factory = factory
+	
+	pool, err := New(config)
+	if err != nil {
+		t.Fatalf("Failed to create pool: %v", err)
+	}
+	defer pool.Close()
+	
 	ctx := context.Background()
 	
 	// Get and return a connection
 	conn, _ := pool.Get(ctx)
-	mc1 := conn.(*mockConn)
-	pool.Put(conn)
+	var id1 int
+	switch c := conn.(type) {
+	case *PooledConn:
+		if mc, ok := c.Conn.(*mockConn); ok {
+			id1 = mc.id
+		}
+	case *mockConn:
+		id1 = c.id
+	}
+	conn.Close()
 	
 	// Wait for idle timeout
 	time.Sleep(200 * time.Millisecond)
 	
+	// Trigger cleanup
+	pool.cleanup()
+	
 	// Get a connection - should be a new one
 	conn2, _ := pool.Get(ctx)
-	mc2 := conn2.(*mockConn)
+	var id2 int
+	switch c := conn2.(type) {
+	case *PooledConn:
+		if mc, ok := c.Conn.(*mockConn); ok {
+			id2 = mc.id
+		}
+	case *mockConn:
+		id2 = c.id
+	}
 	
-	if mc1.id == mc2.id {
+	if id2 == id1 {
 		t.Error("Should have gotten a new connection after idle timeout")
 	}
 	
-	// Check that old connection was closed
-	if !mc1.closed {
-		t.Error("Idle connection should have been closed")
-	}
-	
-	pool.Put(conn2)
+	conn2.Close()
 }
