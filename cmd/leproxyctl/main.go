@@ -43,29 +43,32 @@ var (
 	verbose   = flag.Bool("v", false, "Verbose output")
 )
 
-func main() {
+func run() error {
 	flag.Usage = usage
 	flag.Parse()
 
 	if flag.NArg() < 1 {
 		usage()
-		os.Exit(1)
+		return fmt.Errorf("no command specified")
 	}
 
 	cmdName := flag.Arg(0)
 	for _, cmd := range commands {
 		if cmd.Name == cmdName {
-			if err := cmd.Run(flag.Args()[1:]); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
-			}
-			return
+			return cmd.Run(flag.Args()[1:])
 		}
 	}
 
 	fmt.Fprintf(os.Stderr, "Unknown command: %s\n", cmdName)
 	usage()
-	os.Exit(1)
+	return fmt.Errorf("unknown command: %s", cmdName)
+}
+
+func main() {
+	if err := run(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
 }
 
 func usage() {
