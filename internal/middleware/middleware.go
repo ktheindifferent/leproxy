@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"plugin"
+	"runtime/debug"
 	"sync"
 	"time"
 )
@@ -54,6 +55,11 @@ func (c *Chain) Append(middlewares ...Middleware) *Chain {
 	copy(newMiddlewares, c.middlewares)
 	copy(newMiddlewares[len(c.middlewares):], middlewares)
 	return &Chain{middlewares: newMiddlewares}
+}
+
+// Use adds middleware to the existing chain (modifies in place)
+func (c *Chain) Use(middleware Middleware) {
+	c.middlewares = append(c.middlewares, middleware)
 }
 
 // PluginManager manages loaded plugins
@@ -172,13 +178,23 @@ func Logger(next http.Handler) http.Handler {
 	})
 }
 
-// Recovery recovers from panics
+// Recovery recovers from panics and prevents server crashes
 func Recovery(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if err := recover(); err != nil {
-				w.WriteHeader(http.StatusInternalServerError)
-				// Log the panic (implementation depends on your logger)
+				// Log the panic with stack trace
+				logPanic(r, err)
+				
+				// Check if response has already been written
+				if rw, ok := w.(*responseWriter); ok && !rw.written {
+					w.WriteHeader(http.StatusInternalServerError)
+					w.Write([]byte("Internal Server Error"))
+				} else if !ok {
+					// Try to write error response if not already written
+					w.WriteHeader(http.StatusInternalServerError)
+					w.Write([]byte("Internal Server Error"))
+				}
 			}
 		}()
 		
@@ -377,6 +393,15 @@ func joinStrings(strings []string) string {
 func matchPath(path, pattern string) (bool, map[string]string) {
 	// Simple path matching implementation
 	return path == pattern, nil
+}
+
+// logPanic logs panic information including stack trace
+func logPanic(r *http.Request, err interface{}) {
+	// Get stack trace
+	stack := debug.Stack()
+	
+	// Log the panic - in production, this would use your actual logger
+	fmt.Printf("[PANIC] %s %s - Error: %v\nStack:\n%s\n", r.Method, r.URL.Path, err, stack)
 }
 
 // MiddlewareStack manages ordered middleware execution

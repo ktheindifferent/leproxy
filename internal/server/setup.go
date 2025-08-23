@@ -10,6 +10,7 @@ import (
 
 	"github.com/artyom/leproxy/internal/errors"
 	"github.com/artyom/leproxy/internal/logger"
+	"github.com/artyom/leproxy/internal/safe"
 	"golang.org/x/crypto/acme/autocert"
 )
 
@@ -95,8 +96,12 @@ func StartHTTPS(srv *http.Server, idleTimeout time.Duration) error {
 	}
 
 	if idleTimeout > 0 {
+		tcpLn, err := safe.AssertTCPListener(ln)
+		if err != nil {
+			return errors.Wrap(err, errors.ErrConnection, "failed to setup keep-alive")
+		}
 		ln = &tcpKeepAliveListener{
-			TCPListener: ln.(*net.TCPListener),
+			TCPListener: tcpLn,
 			timeout:     idleTimeout,
 		}
 	}
