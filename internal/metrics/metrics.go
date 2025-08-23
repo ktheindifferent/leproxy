@@ -329,6 +329,10 @@ func RecordCertificateRenewal(domain string, success bool) {
 }
 
 // Default registry functions
+func DefaultRegistry() *Registry {
+	return defaultRegistry
+}
+
 func Register(name string, metricType MetricType, help string) *Metric {
 	return defaultRegistry.Register(name, metricType, help)
 }
