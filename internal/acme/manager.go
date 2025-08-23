@@ -56,7 +56,8 @@ const (
 // Manager wraps autocert.Manager with additional functionality
 type Manager struct {
 	*autocert.Manager
-	config *Config
+	config         *Config
+	renewalManager *RenewalManager
 }
 
 // NewManager creates a new ACME certificate manager
@@ -82,10 +83,15 @@ func NewManager(config *Config) (*Manager, error) {
 		return nil, err
 	}
 
-	return &Manager{
+	m := &Manager{
 		Manager: manager,
 		config:  config,
-	}, nil
+	}
+	
+	// Initialize renewal manager
+	m.renewalManager = NewRenewalManager(m)
+	
+	return m, nil
 }
 
 // GetTLSConfig returns the TLS configuration for the manager
@@ -96,24 +102,35 @@ func (m *Manager) GetTLSConfig() *tls.Config {
 	return config
 }
 
-// RenewCertificates checks and renews certificates if needed
+// StartRenewalManager starts the automatic renewal process
+func (m *Manager) StartRenewalManager(ctx context.Context) {
+	m.renewalManager.Start(ctx)
+}
+
+// StopRenewalManager stops the automatic renewal process
+func (m *Manager) StopRenewalManager() {
+	m.renewalManager.Stop()
+}
+
+// SetRenewalAlertHandler sets the alert handler for renewal failures
+func (m *Manager) SetRenewalAlertHandler(handler AlertHandler) {
+	m.renewalManager.SetAlertHandler(handler)
+}
+
+// GetRenewalStatus returns the current renewal status for all domains
+func (m *Manager) GetRenewalStatus() map[string]*RenewalStatus {
+	return m.renewalManager.GetStatus()
+}
+
+// GetRenewalHistory returns the renewal history
+func (m *Manager) GetRenewalHistory() []RenewalHistory {
+	return m.renewalManager.GetHistory()
+}
+
+// RenewCertificates checks and renews certificates if needed (deprecated - use StartRenewalManager)
 func (m *Manager) RenewCertificates(ctx context.Context) error {
-	logger.Info("Checking certificates for renewal")
-	
-	for _, domain := range m.config.Domains {
-		cert, err := m.Manager.GetCertificate(&tls.ClientHelloInfo{
-			ServerName: domain,
-		})
-		if err != nil {
-			logger.Warn("Failed to get certificate", "domain", domain, "error", err)
-			continue
-		}
-		
-		if cert != nil && len(cert.Certificate) > 0 {
-			logger.Debug("Certificate valid", "domain", domain)
-		}
-	}
-	
+	logger.Info("Checking certificates for renewal (deprecated method - use StartRenewalManager)")
+	m.renewalManager.checkAndRenewAll(ctx)
 	return nil
 }
 
