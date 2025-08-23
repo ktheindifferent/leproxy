@@ -12,7 +12,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-func main() {
+func run() error {
 	var (
 		listProviders   = flag.Bool("list", false, "List all available ACME providers")
 		showProvider    = flag.String("show", "", "Show detailed information about a specific provider")
@@ -29,17 +29,15 @@ func main() {
 	
 	if *listProviders {
 		listAllProviders()
-		return
+		return nil
 	}
 	
 	if *showProvider != "" {
-		showProviderDetails(*showProvider)
-		return
+		return showProviderDetails(*showProvider)
 	}
 	
 	if *generateConfig != "" {
-		generateConfiguration(*generateConfig, *provider, *email, *eabKID, *eabHMAC, *testMode, *outputFormat)
-		return
+		return generateConfiguration(*generateConfig, *provider, *email, *eabKID, *eabHMAC, *testMode, *outputFormat)
 	}
 	
 	// Default: show usage
@@ -56,6 +54,14 @@ func main() {
 	fmt.Println("  acme-config -generate config.yaml -provider zerossl -email user@example.com -eab-kid YOUR_KID -eab-hmac YOUR_HMAC")
 	fmt.Println()
 	flag.PrintDefaults()
+	return nil
+}
+
+func main() {
+	if err := run(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
 }
 
 func listAllProviders() {
@@ -99,11 +105,10 @@ func listAllProviders() {
 	fmt.Println("- Buypass offers 180-day certificates but doesn't support wildcards")
 }
 
-func showProviderDetails(providerName string) {
+func showProviderDetails(providerName string) error {
 	info := acme.GetProviderInfo(providerName)
 	if info == nil {
-		fmt.Fprintf(os.Stderr, "Unknown provider: %s\n", providerName)
-		os.Exit(1)
+		return fmt.Errorf("unknown provider: %s", providerName)
 	}
 	
 	fmt.Printf("Provider: %s\n", info.DisplayName)
@@ -152,23 +157,21 @@ func showProviderDetails(providerName string) {
 		fmt.Println("\nNote: Buypass does not support wildcard certificates (*.example.com)")
 		fmt.Println("However, it offers 180-day certificates (double the standard 90 days)")
 	}
+	return nil
 }
 
-func generateConfiguration(filename, provider, email, eabKID, eabHMAC string, testMode bool, format string) {
+func generateConfiguration(filename, provider, email, eabKID, eabHMAC string, testMode bool, format string) error {
 	info := acme.GetProviderInfo(provider)
 	if info == nil {
-		fmt.Fprintf(os.Stderr, "Unknown provider: %s\n", provider)
-		os.Exit(1)
+		return fmt.Errorf("unknown provider: %s", provider)
 	}
 	
 	if email == "" {
-		fmt.Fprintln(os.Stderr, "Email is required for configuration generation")
-		os.Exit(1)
+		return fmt.Errorf("email is required for configuration generation")
 	}
 	
 	if info.RequiresEAB && (eabKID == "" || eabHMAC == "") {
-		fmt.Fprintf(os.Stderr, "Provider %s requires EAB credentials (--eab-kid and --eab-hmac)\n", provider)
-		os.Exit(1)
+		return fmt.Errorf("provider %s requires EAB credentials (--eab-kid and --eab-hmac)", provider)
 	}
 	
 	// Create configuration structure
@@ -214,8 +217,7 @@ func generateConfiguration(filename, provider, email, eabKID, eabHMAC string, te
 	// Write configuration file
 	file, err := os.Create(filename)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to create file: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("failed to create file: %w", err)
 	}
 	defer file.Close()
 	
@@ -223,14 +225,12 @@ func generateConfiguration(filename, provider, email, eabKID, eabHMAC string, te
 		encoder := json.NewEncoder(file)
 		encoder.SetIndent("", "  ")
 		if err := encoder.Encode(config); err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to write JSON: %v\n", err)
-			os.Exit(1)
+			return fmt.Errorf("failed to write JSON: %w", err)
 		}
 	} else {
 		encoder := yaml.NewEncoder(file)
 		if err := encoder.Encode(config); err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to write YAML: %v\n", err)
-			os.Exit(1)
+			return fmt.Errorf("failed to write YAML: %w", err)
 		}
 	}
 	
@@ -248,4 +248,5 @@ func generateConfiguration(filename, provider, email, eabKID, eabHMAC string, te
 	if !info.SupportsWildcard {
 		fmt.Println("\nNote: This provider does not support wildcard certificates")
 	}
+	return nil
 }

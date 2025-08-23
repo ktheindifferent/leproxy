@@ -63,12 +63,14 @@ func main() {
 	
 	// Initialize enhanced logging
 	if err := logger.Init(args.LogLevel, args.LogFormat == "json"); err != nil {
-		log.Fatalf("Failed to initialize logger: %v", err)
+		log.Printf("Failed to initialize logger: %v", err)
+		os.Exit(1)
 	}
 	
 	// Start the proxy server with the configured arguments
 	if err := run(args); err != nil {
-		logger.Fatal("Server failed to start", "error", err)
+		logger.Error("Server failed to start", map[string]interface{}{"error": err})
+		os.Exit(1)
 	}
 }
 
