@@ -3,7 +3,11 @@ package tracing
 import (
 	"context"
 	"fmt"
+	"log"
 	"net/http"
+	"os"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -12,11 +16,13 @@ import (
 	"go.opentelemetry.io/otel/exporters/jaeger"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/exporters/stdout/stdouttrace"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	semconv "go.opentelemetry.io/otel/semconv/v1.17.0"
 	"go.opentelemetry.io/otel/trace"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 // Config holds tracing configuration
@@ -39,47 +45,52 @@ type Config struct {
 
 // TracerProvider wraps the OpenTelemetry tracer provider
 type TracerProvider struct {
-	provider *sdktrace.TracerProvider
-	tracer   trace.Tracer
-	config   Config
+	provider        *sdktrace.TracerProvider
+	tracer          trace.Tracer
+	config          ExtendedConfig
+	validator       *ConfigValidator
+	circuitBreaker  *CircuitBreaker
+	metricsCollector *MetricsCollector
+	mu              sync.RWMutex
+	fallbackActive  bool
 }
 
-// NewTracerProvider creates a new tracer provider
+// NewTracerProvider creates a new tracer provider with enhanced configuration
 func NewTracerProvider(cfg Config) (*TracerProvider, error) {
+	return NewTracerProviderWithExtendedConfig(ExtendedConfig{Config: cfg})
+}
+
+// NewTracerProviderWithExtendedConfig creates a new tracer provider with extended configuration
+func NewTracerProviderWithExtendedConfig(cfg ExtendedConfig) (*TracerProvider, error) {
+	// Create validator
+	validator := NewConfigValidator()
+	
+	// Validate configuration
+	if err := validator.ValidateConfig(&cfg); err != nil {
+		return nil, fmt.Errorf("configuration validation failed: %w", err)
+	}
+	
 	if !cfg.Enabled {
 		// Return no-op provider if tracing is disabled
 		return &TracerProvider{
-			tracer: otel.Tracer(cfg.ServiceName),
-			config: cfg,
+			tracer:    otel.Tracer(cfg.ServiceName),
+			config:    cfg,
+			validator: validator,
 		}, nil
 	}
 	
-	// Create resource
-	res, err := resource.Merge(
-		resource.Default(),
-		resource.NewWithAttributes(
-			semconv.SchemaURL,
-			semconv.ServiceNameKey.String(cfg.ServiceName),
-			semconv.ServiceVersionKey.String("1.0.0"),
-			attribute.String("environment", cfg.Environment),
-		),
+	// Create resource - using NewSchemaless to avoid schema conflicts
+	res := resource.NewSchemaless(
+		attribute.String("service.name", cfg.ServiceName),
+		attribute.String("service.version", "1.0.0"),
+		attribute.String("environment", cfg.Environment),
 	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create resource: %w", err)
-	}
 	
-	// Create exporter based on type
-	var exporter sdktrace.SpanExporter
-	switch cfg.ExporterType {
-	case "jaeger":
-		exporter, err = createJaegerExporter(cfg)
-	case "otlp":
-		exporter, err = createOTLPExporter(cfg)
-	default:
-		// Use stdout exporter as fallback
-		exporter, err = createStdoutExporter()
-	}
+	// Create metrics collector
+	metricsCollector := NewMetricsCollector()
 	
+	// Create exporter with health checks and fallback
+	exporter, fallbackActive, err := createExporterWithFallback(context.Background(), cfg, validator, metricsCollector)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create exporter: %w", err)
 	}
@@ -100,11 +111,26 @@ func NewTracerProvider(cfg Config) (*TracerProvider, error) {
 		propagation.Baggage{},
 	))
 	
-	return &TracerProvider{
-		provider: provider,
-		tracer:   provider.Tracer(cfg.ServiceName),
-		config:   cfg,
-	}, nil
+	tp := &TracerProvider{
+		provider:         provider,
+		tracer:           provider.Tracer(cfg.ServiceName),
+		config:           cfg,
+		validator:        validator,
+		metricsCollector: metricsCollector,
+		fallbackActive:   fallbackActive,
+	}
+	
+	// Get circuit breaker for the endpoint if enabled
+	if cfg.EnableCircuitBreaker {
+		endpoint := getEndpointFromConfig(cfg)
+		tp.circuitBreaker = validator.GetCircuitBreaker(
+			endpoint,
+			cfg.CircuitBreakerThreshold,
+			cfg.CircuitBreakerTimeout,
+		)
+	}
+	
+	return tp, nil
 }
 
 // Shutdown shuts down the tracer provider
@@ -125,18 +151,30 @@ func (tp *TracerProvider) StartSpan(ctx context.Context, name string, opts ...tr
 	return tp.tracer.Start(ctx, name, opts...)
 }
 
-// createJaegerExporter creates a Jaeger exporter
-func createJaegerExporter(cfg Config) (sdktrace.SpanExporter, error) {
+// createJaegerExporter creates a Jaeger exporter with timeout support
+func createJaegerExporter(cfg ExtendedConfig) (sdktrace.SpanExporter, error) {
 	endpoint := cfg.JaegerEndpoint
 	if endpoint == "" {
 		endpoint = "http://localhost:14268/api/traces"
 	}
 	
-	return jaeger.New(jaeger.WithCollectorEndpoint(jaeger.WithEndpoint(endpoint)))
+	opts := []jaeger.CollectorEndpointOption{
+		jaeger.WithEndpoint(endpoint),
+	}
+	
+	// Add timeout if configured
+	if cfg.ExportTimeout > 0 {
+		client := &http.Client{
+			Timeout: cfg.ExportTimeout,
+		}
+		opts = append(opts, jaeger.WithHTTPClient(client))
+	}
+	
+	return jaeger.New(jaeger.WithCollectorEndpoint(opts...))
 }
 
-// createOTLPExporter creates an OTLP exporter
-func createOTLPExporter(cfg Config) (sdktrace.SpanExporter, error) {
+// createOTLPExporter creates an OTLP exporter with timeout support
+func createOTLPExporter(ctx context.Context, cfg ExtendedConfig) (sdktrace.SpanExporter, error) {
 	endpoint := cfg.OTLPEndpoint
 	if endpoint == "" {
 		endpoint = "localhost:4317"
@@ -146,7 +184,20 @@ func createOTLPExporter(cfg Config) (sdktrace.SpanExporter, error) {
 		otlptracegrpc.WithEndpoint(endpoint),
 	}
 	
-	if cfg.OTLPInsecure {
+	// Configure connection with timeout
+	if cfg.ConnectionTimeout > 0 {
+		dialOpts := []grpc.DialOption{
+			grpc.WithBlock(),
+			grpc.WithTimeout(cfg.ConnectionTimeout),
+		}
+		
+		if cfg.OTLPInsecure {
+			dialOpts = append(dialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+			opts = append(opts, otlptracegrpc.WithInsecure())
+		}
+		
+		opts = append(opts, otlptracegrpc.WithDialOption(dialOpts...))
+	} else if cfg.OTLPInsecure {
 		opts = append(opts, otlptracegrpc.WithInsecure())
 	}
 	
@@ -154,13 +205,30 @@ func createOTLPExporter(cfg Config) (sdktrace.SpanExporter, error) {
 		opts = append(opts, otlptracegrpc.WithHeaders(cfg.OTLPHeaders))
 	}
 	
+	// Add timeout for export operations
+	if cfg.ExportTimeout > 0 {
+		opts = append(opts, otlptracegrpc.WithTimeout(cfg.ExportTimeout))
+	}
+	
 	client := otlptracegrpc.NewClient(opts...)
-	return otlptrace.New(context.Background(), client)
+	
+	// Create context with connection timeout
+	exportCtx := ctx
+	if cfg.ConnectionTimeout > 0 {
+		var cancel context.CancelFunc
+		exportCtx, cancel = context.WithTimeout(ctx, cfg.ConnectionTimeout)
+		defer cancel()
+	}
+	
+	return otlptrace.New(exportCtx, client)
 }
 
 // createStdoutExporter creates a stdout exporter for debugging
 func createStdoutExporter() (sdktrace.SpanExporter, error) {
-	return sdktrace.NewExporter(sdktrace.WithStdout())
+	return stdouttrace.New(
+		stdouttrace.WithWriter(os.Stdout),
+		stdouttrace.WithPrettyPrint(),
+	)
 }
 
 // HTTPMiddleware creates HTTP middleware for tracing
@@ -176,12 +244,12 @@ func HTTPMiddleware(tp *TracerProvider) func(http.Handler) http.Handler {
 				spanName,
 				trace.WithSpanKind(trace.SpanKindServer),
 				trace.WithAttributes(
-					semconv.HTTPMethodKey.String(r.Method),
-					semconv.HTTPTargetKey.String(r.URL.Path),
-					semconv.HTTPSchemeKey.String(r.URL.Scheme),
-					semconv.HTTPHostKey.String(r.Host),
-					semconv.HTTPUserAgentKey.String(r.UserAgent()),
-					semconv.HTTPRequestContentLengthKey.Int64(r.ContentLength),
+					attribute.String("http.method", r.Method),
+					attribute.String("http.target", r.URL.Path),
+					attribute.String("http.scheme", r.URL.Scheme),
+					attribute.String("http.host", r.Host),
+					attribute.String("http.user_agent", r.UserAgent()),
+					attribute.Int64("http.request_content_length", r.ContentLength),
 				),
 			)
 			defer span.End()
@@ -199,7 +267,7 @@ func HTTPMiddleware(tp *TracerProvider) func(http.Handler) http.Handler {
 			
 			// Set span attributes
 			span.SetAttributes(
-				semconv.HTTPStatusCodeKey.Int(wrapped.statusCode),
+				attribute.Int("http.status_code", wrapped.statusCode),
 				attribute.Int64("http.response_content_length", wrapped.bytesWritten),
 				attribute.Float64("http.duration_ms", float64(duration.Milliseconds())),
 			)
@@ -246,10 +314,10 @@ func TraceRequest(ctx context.Context, req *http.Request, spanName string) (*htt
 	ctx, span := tracer.Start(ctx, spanName,
 		trace.WithSpanKind(trace.SpanKindClient),
 		trace.WithAttributes(
-			semconv.HTTPMethodKey.String(req.Method),
-			semconv.HTTPURLKey.String(req.URL.String()),
-			semconv.HTTPTargetKey.String(req.URL.Path),
-			semconv.HTTPHostKey.String(req.Host),
+			attribute.String("http.method", req.Method),
+			attribute.String("http.url", req.URL.String()),
+			attribute.String("http.target", req.URL.Path),
+			attribute.String("http.host", req.Host),
 		),
 	)
 	
@@ -268,7 +336,7 @@ func TraceResponse(span trace.Span, resp *http.Response, err error) {
 	}
 	
 	span.SetAttributes(
-		semconv.HTTPStatusCodeKey.Int(resp.StatusCode),
+		attribute.Int("http.status_code", resp.StatusCode),
 		attribute.Int64("http.response_content_length", resp.ContentLength),
 	)
 	
@@ -376,4 +444,207 @@ func InjectHTTPHeaders(ctx context.Context, headers http.Header) {
 // ExtractHTTPHeaders extracts trace context from HTTP headers
 func ExtractHTTPHeaders(ctx context.Context, headers http.Header) context.Context {
 	return otel.GetTextMapPropagator().Extract(ctx, propagation.HeaderCarrier(headers))
+}
+
+// createExporterWithFallback creates an exporter with health checks and fallback support
+func createExporterWithFallback(ctx context.Context, cfg ExtendedConfig, validator *ConfigValidator, metrics *MetricsCollector) (sdktrace.SpanExporter, bool, error) {
+	var primaryExporter sdktrace.SpanExporter
+	var err error
+	fallbackActive := false
+	
+	// Check endpoint health if not stdout
+	if cfg.ExporterType != "stdout" {
+		endpoint := getEndpointFromConfig(cfg)
+		healthy, healthErr := validator.CheckEndpointHealth(ctx, cfg.ExporterType, endpoint)
+		
+		if !healthy && cfg.EnableFallback {
+			log.Printf("Primary exporter endpoint %s is unhealthy: %v. Using fallback to stdout", endpoint, healthErr)
+			metrics.RecordExportFailure(cfg.ExporterType, "health_check_failed")
+			fallbackActive = true
+		}
+	}
+	
+	// Create primary exporter or fallback
+	if !fallbackActive {
+		// Try to create the primary exporter with retry
+		err = RetryWithBackoff(ctx, func() error {
+			switch cfg.ExporterType {
+			case "jaeger":
+				primaryExporter, err = createJaegerExporter(cfg)
+			case "otlp":
+				primaryExporter, err = createOTLPExporter(ctx, cfg)
+			case "stdout":
+				primaryExporter, err = createStdoutExporter()
+			default:
+				primaryExporter, err = createStdoutExporter()
+			}
+			return err
+		}, cfg.MaxRetries, cfg.RetryDelay)
+		
+		if err != nil && cfg.EnableFallback {
+			log.Printf("Failed to create primary exporter after retries: %v. Using fallback to stdout", err)
+			metrics.RecordExportFailure(cfg.ExporterType, "creation_failed")
+			fallbackActive = true
+		}
+	}
+	
+	// Use fallback if needed
+	if fallbackActive && cfg.FallbackToStdout {
+		primaryExporter, err = createStdoutExporter()
+		if err != nil {
+			return nil, false, fmt.Errorf("failed to create fallback stdout exporter: %w", err)
+		}
+		metrics.RecordFallbackActivation()
+	} else if err != nil {
+		return nil, false, err
+	}
+	
+	// Wrap exporter with metrics collection
+	wrappedExporter := &MetricExporter{
+		exporter: primaryExporter,
+		metrics:  metrics,
+		exporterType: cfg.ExporterType,
+	}
+	
+	return wrappedExporter, fallbackActive, nil
+}
+
+// getEndpointFromConfig extracts the endpoint from configuration
+func getEndpointFromConfig(cfg ExtendedConfig) string {
+	switch cfg.ExporterType {
+	case "jaeger":
+		if cfg.JaegerEndpoint != "" {
+			return cfg.JaegerEndpoint
+		}
+		return "http://localhost:14268/api/traces"
+	case "otlp":
+		if cfg.OTLPEndpoint != "" {
+			return cfg.OTLPEndpoint
+		}
+		return "localhost:4317"
+	default:
+		return ""
+	}
+}
+
+// MetricsCollector collects metrics for tracing operations
+type MetricsCollector struct {
+	mu                 sync.RWMutex
+	exportSuccesses    map[string]int64
+	exportFailures     map[string]int64
+	exportLatencies    map[string][]time.Duration
+	fallbackActivations int64
+}
+
+// NewMetricsCollector creates a new metrics collector
+func NewMetricsCollector() *MetricsCollector {
+	return &MetricsCollector{
+		exportSuccesses: make(map[string]int64),
+		exportFailures:  make(map[string]int64),
+		exportLatencies: make(map[string][]time.Duration),
+	}
+}
+
+// RecordExportSuccess records a successful export
+func (mc *MetricsCollector) RecordExportSuccess(exporterType string, latency time.Duration) {
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+	
+	mc.exportSuccesses[exporterType]++
+	mc.exportLatencies[exporterType] = append(mc.exportLatencies[exporterType], latency)
+	
+	// Keep only last 100 latency measurements
+	if len(mc.exportLatencies[exporterType]) > 100 {
+		mc.exportLatencies[exporterType] = mc.exportLatencies[exporterType][1:]
+	}
+}
+
+// RecordExportFailure records a failed export
+func (mc *MetricsCollector) RecordExportFailure(exporterType string, reason string) {
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+	
+	key := fmt.Sprintf("%s_%s", exporterType, reason)
+	mc.exportFailures[key]++
+}
+
+// RecordFallbackActivation records when fallback is activated
+func (mc *MetricsCollector) RecordFallbackActivation() {
+	atomic.AddInt64(&mc.fallbackActivations, 1)
+}
+
+// GetMetrics returns current metrics
+func (mc *MetricsCollector) GetMetrics() map[string]interface{} {
+	mc.mu.RLock()
+	defer mc.mu.RUnlock()
+	
+	metrics := make(map[string]interface{})
+	metrics["export_successes"] = mc.exportSuccesses
+	metrics["export_failures"] = mc.exportFailures
+	metrics["fallback_activations"] = atomic.LoadInt64(&mc.fallbackActivations)
+	
+	// Calculate average latencies
+	avgLatencies := make(map[string]float64)
+	for exporterType, latencies := range mc.exportLatencies {
+		if len(latencies) > 0 {
+			var sum time.Duration
+			for _, l := range latencies {
+				sum += l
+			}
+			avgLatencies[exporterType] = float64(sum.Milliseconds()) / float64(len(latencies))
+		}
+	}
+	metrics["average_export_latencies_ms"] = avgLatencies
+	
+	return metrics
+}
+
+// MetricExporter wraps an exporter with metrics collection
+type MetricExporter struct {
+	exporter     sdktrace.SpanExporter
+	metrics      *MetricsCollector
+	exporterType string
+}
+
+// ExportSpans exports spans with metrics collection
+func (me *MetricExporter) ExportSpans(ctx context.Context, spans []sdktrace.ReadOnlySpan) error {
+	start := time.Now()
+	err := me.exporter.ExportSpans(ctx, spans)
+	latency := time.Since(start)
+	
+	if err != nil {
+		me.metrics.RecordExportFailure(me.exporterType, "export_error")
+		return err
+	}
+	
+	me.metrics.RecordExportSuccess(me.exporterType, latency)
+	return nil
+}
+
+// Shutdown shuts down the exporter
+func (me *MetricExporter) Shutdown(ctx context.Context) error {
+	return me.exporter.Shutdown(ctx)
+}
+
+// IsFallbackActive returns true if the fallback exporter is being used
+func (tp *TracerProvider) IsFallbackActive() bool {
+	tp.mu.RLock()
+	defer tp.mu.RUnlock()
+	return tp.fallbackActive
+}
+
+// GetMetrics returns tracing metrics
+func (tp *TracerProvider) GetMetrics() map[string]interface{} {
+	if tp.metricsCollector != nil {
+		return tp.metricsCollector.GetMetrics()
+	}
+	return nil
+}
+
+// GetCircuitBreakerState returns the circuit breaker state if enabled
+func (tp *TracerProvider) GetCircuitBreakerState() string {
+	if tp.circuitBreaker != nil {
+		return tp.circuitBreaker.GetState()
+	}
+	return "disabled"
 }
