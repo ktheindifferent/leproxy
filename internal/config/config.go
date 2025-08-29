@@ -163,6 +163,47 @@ type AdvancedConfig struct {
 	ProfilingPort           int      `yaml:"profiling_port" json:"profiling_port" default:"6060"`
 	MaxHeaderBytes          int      `yaml:"max_header_bytes" json:"max_header_bytes" default:"1048576"`
 	DisableHTTP2            bool     `yaml:"disable_http2" json:"disable_http2" default:"false"`
+	
+	// Tracing configuration
+	Tracing TracingConfig `yaml:"tracing" json:"tracing"`
+}
+
+type TracingConfig struct {
+	Enabled      bool              `yaml:"enabled" json:"enabled" default:"false"`
+	ServiceName  string            `yaml:"service_name" json:"service_name" default:"leproxy"`
+	Environment  string            `yaml:"environment" json:"environment" default:"production"`
+	ExporterType string            `yaml:"exporter_type" json:"exporter_type" default:"stdout" enum:"jaeger,otlp,stdout"`
+	SampleRate   float64           `yaml:"sample_rate" json:"sample_rate" default:"1.0"`
+	
+	// Jaeger specific
+	JaegerEndpoint string `yaml:"jaeger_endpoint" json:"jaeger_endpoint"`
+	
+	// OTLP specific
+	OTLPEndpoint string            `yaml:"otlp_endpoint" json:"otlp_endpoint"`
+	OTLPInsecure bool              `yaml:"otlp_insecure" json:"otlp_insecure" default:"true"`
+	OTLPHeaders  map[string]string `yaml:"otlp_headers" json:"otlp_headers"`
+	
+	// Timeout configuration
+	ConnectionTimeout Duration `yaml:"connection_timeout" json:"connection_timeout" default:"5s"`
+	ExportTimeout     Duration `yaml:"export_timeout" json:"export_timeout" default:"10s"`
+	
+	// Retry configuration
+	MaxRetries               int      `yaml:"max_retries" json:"max_retries" default:"3"`
+	RetryDelay               Duration `yaml:"retry_delay" json:"retry_delay" default:"1s"`
+	EnableExponentialBackoff bool     `yaml:"enable_exponential_backoff" json:"enable_exponential_backoff" default:"true"`
+	
+	// Health check configuration
+	HealthCheckInterval Duration `yaml:"health_check_interval" json:"health_check_interval" default:"30s"`
+	HealthCheckTimeout  Duration `yaml:"health_check_timeout" json:"health_check_timeout" default:"3s"`
+	
+	// Fallback configuration
+	EnableFallback   bool `yaml:"enable_fallback" json:"enable_fallback" default:"true"`
+	FallbackToStdout bool `yaml:"fallback_to_stdout" json:"fallback_to_stdout" default:"true"`
+	
+	// Circuit breaker configuration
+	EnableCircuitBreaker    bool     `yaml:"enable_circuit_breaker" json:"enable_circuit_breaker" default:"true"`
+	CircuitBreakerThreshold int      `yaml:"circuit_breaker_threshold" json:"circuit_breaker_threshold" default:"5"`
+	CircuitBreakerTimeout   Duration `yaml:"circuit_breaker_timeout" json:"circuit_breaker_timeout" default:"30s"`
 }
 
 // Duration is a custom type for time.Duration that supports YAML/JSON marshaling
@@ -326,6 +367,69 @@ func (c *Config) Validate() error {
 	// Validate logging configuration
 	if c.Logging.Output == "file" && c.Logging.FilePath == "" {
 		errors = append(errors, "file_path is required when output is 'file'")
+	}
+	
+	// Validate tracing configuration
+	if c.Advanced.Tracing.Enabled {
+		if c.Advanced.Tracing.ServiceName == "" {
+			errors = append(errors, "tracing service_name is required when tracing is enabled")
+		}
+		
+		if c.Advanced.Tracing.SampleRate < 0 || c.Advanced.Tracing.SampleRate > 1 {
+			errors = append(errors, fmt.Sprintf("tracing sample_rate must be between 0 and 1, got %f", c.Advanced.Tracing.SampleRate))
+		}
+		
+		// Validate exporter-specific configuration
+		switch c.Advanced.Tracing.ExporterType {
+		case "jaeger":
+			if c.Advanced.Tracing.JaegerEndpoint != "" {
+				if _, err := url.Parse(c.Advanced.Tracing.JaegerEndpoint); err != nil {
+					errors = append(errors, fmt.Sprintf("invalid Jaeger endpoint URL: %v", err))
+				}
+			}
+		case "otlp":
+			if c.Advanced.Tracing.OTLPEndpoint != "" {
+				// Check if it's a valid host:port format
+				if _, _, err := net.SplitHostPort(c.Advanced.Tracing.OTLPEndpoint); err != nil {
+					// Try without port (will use default)
+					if strings.Contains(c.Advanced.Tracing.OTLPEndpoint, ":") {
+						errors = append(errors, fmt.Sprintf("invalid OTLP endpoint format: %v", err))
+					}
+				}
+			}
+		case "stdout":
+			// Stdout exporter doesn't need validation
+		default:
+			if c.Advanced.Tracing.ExporterType != "" {
+				errors = append(errors, fmt.Sprintf("unsupported tracing exporter type: %s", c.Advanced.Tracing.ExporterType))
+			}
+		}
+		
+		// Validate circuit breaker configuration
+		if c.Advanced.Tracing.EnableCircuitBreaker {
+			if c.Advanced.Tracing.CircuitBreakerThreshold < 1 {
+				errors = append(errors, "circuit_breaker_threshold must be at least 1")
+			}
+			if time.Duration(c.Advanced.Tracing.CircuitBreakerTimeout) < time.Second {
+				errors = append(errors, "circuit_breaker_timeout must be at least 1 second")
+			}
+		}
+		
+		// Validate timeouts
+		if time.Duration(c.Advanced.Tracing.ConnectionTimeout) < 0 {
+			errors = append(errors, "connection_timeout cannot be negative")
+		}
+		if time.Duration(c.Advanced.Tracing.ExportTimeout) < 0 {
+			errors = append(errors, "export_timeout cannot be negative")
+		}
+		
+		// Validate retry configuration
+		if c.Advanced.Tracing.MaxRetries < 0 {
+			errors = append(errors, "max_retries cannot be negative")
+		}
+		if time.Duration(c.Advanced.Tracing.RetryDelay) < 0 {
+			errors = append(errors, "retry_delay cannot be negative")
+		}
 	}
 	
 	if len(errors) > 0 {

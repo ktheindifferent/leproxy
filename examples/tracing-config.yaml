@@ -1,0 +1,146 @@
+# Example LeProxy configuration with advanced tracing settings
+
+server:
+  http_addr: ":80"
+  https_addr: ":443"
+  acme:
+    provider: letsencrypt
+    email: admin@example.com
+    cache_dir: /var/cache/letsencrypt
+
+mappings:
+  api.example.com:
+    url: http://backend-api:8080
+    health_check: /health
+    max_connections: 100
+    connect_timeout: 10s
+
+database_proxies:
+  - name: postgres-main
+    type: postgres
+    listen: ":5432"
+    backend: "postgres-server:5432"
+    tls: true
+    pool:
+      enabled: true
+      min_conns: 2
+      max_conns: 10
+
+security:
+  hsts:
+    enabled: true
+    max_age: 31536000
+  rate_limit:
+    enabled: true
+    requests_per_second: 100
+    burst: 500
+
+logging:
+  level: info
+  format: json
+  output: stdout
+
+metrics:
+  enabled: true
+  endpoint: /metrics
+  port: 9090
+
+advanced:
+  graceful_shutdown_timeout: 30s
+  enable_profiling: false
+  
+  # Tracing configuration with validation and fallback
+  tracing:
+    enabled: true
+    service_name: leproxy
+    environment: production
+    exporter_type: jaeger  # Options: jaeger, otlp, stdout
+    sample_rate: 0.1  # Sample 10% of requests
+    
+    # Jaeger configuration
+    jaeger_endpoint: "http://jaeger-collector:14268/api/traces"
+    
+    # OTLP configuration (alternative to Jaeger)
+    # otlp_endpoint: "otel-collector:4317"
+    # otlp_insecure: true
+    # otlp_headers:
+    #   api-key: "your-api-key"
+    
+    # Timeout configuration
+    connection_timeout: 5s  # Timeout for establishing connection to exporter
+    export_timeout: 10s     # Timeout for exporting spans
+    
+    # Retry configuration
+    max_retries: 3
+    retry_delay: 1s
+    enable_exponential_backoff: true
+    
+    # Health check configuration
+    health_check_interval: 30s  # How often to check endpoint health
+    health_check_timeout: 3s    # Timeout for health checks
+    
+    # Fallback configuration
+    enable_fallback: true       # Enable fallback mechanism
+    fallback_to_stdout: true    # Fallback to stdout exporter if primary fails
+    
+    # Circuit breaker configuration
+    enable_circuit_breaker: true
+    circuit_breaker_threshold: 5  # Number of failures before opening circuit
+    circuit_breaker_timeout: 30s  # Time before attempting to close circuit
+
+---
+# Alternative configuration for development with stdout exporter
+
+advanced:
+  tracing:
+    enabled: true
+    service_name: leproxy-dev
+    environment: development
+    exporter_type: stdout  # Print traces to stdout for debugging
+    sample_rate: 1.0      # Sample all requests in development
+    
+    # No endpoint configuration needed for stdout
+    # Fallback and circuit breaker not needed for stdout
+    enable_fallback: false
+    enable_circuit_breaker: false
+
+---
+# Configuration with OTLP exporter and custom headers
+
+advanced:
+  tracing:
+    enabled: true
+    service_name: leproxy
+    environment: production
+    exporter_type: otlp
+    sample_rate: 0.5
+    
+    # OTLP configuration for cloud providers
+    otlp_endpoint: "api.honeycomb.io:443"
+    otlp_insecure: false  # Use TLS
+    otlp_headers:
+      x-honeycomb-team: "your-api-key"
+      x-honeycomb-dataset: "leproxy"
+    
+    # Aggressive timeouts for cloud endpoints
+    connection_timeout: 10s
+    export_timeout: 15s
+    
+    # More retries for network issues
+    max_retries: 5
+    retry_delay: 2s
+    enable_exponential_backoff: true
+    
+    # Enable all safety features
+    enable_fallback: true
+    fallback_to_stdout: true
+    enable_circuit_breaker: true
+    circuit_breaker_threshold: 10
+    circuit_breaker_timeout: 60s
+
+---
+# Minimal configuration with disabled tracing
+
+advanced:
+  tracing:
+    enabled: false  # Tracing completely disabled
