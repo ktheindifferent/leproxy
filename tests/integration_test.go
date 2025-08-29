@@ -294,24 +294,15 @@ func TestRedisProxy(t *testing.T) {
 		EnableTLS: false,
 	}
 
-	listener, err := net.Listen("tcp", "localhost:16379")
-	if err != nil {
-		t.Fatalf("Failed to create listener: %v", err)
+	// Use TestServer for proper resource management
+	server := NewTestServer("localhost:16379", HandlerFunc(proxy.HandleConnection), 50)
+	if err := server.Start(); err != nil {
+		t.Fatalf("Failed to start test server: %v", err)
 	}
-	defer listener.Close()
-
-	go func() {
-		for {
-			conn, err := listener.Accept()
-			if err != nil {
-				return
-			}
-			go proxy.HandleConnection(conn)
-		}
-	}()
+	defer server.Stop()
 
 	// Test connection through proxy
-	conn, err := net.Dial("tcp", "localhost:16379")
+	conn, err := net.Dial("tcp", server.GetAddr())
 	if err != nil {
 		t.Fatalf("Failed to connect to proxy: %v", err)
 	}
@@ -348,24 +339,15 @@ func TestMongoDBProxy(t *testing.T) {
 		EnableTLS: false,
 	}
 
-	listener, err := net.Listen("tcp", "localhost:27018")
-	if err != nil {
-		t.Fatalf("Failed to create listener: %v", err)
+	// Use TestServer for proper resource management
+	server := NewTestServer("localhost:27018", HandlerFunc(proxy.HandleConnection), 50)
+	if err := server.Start(); err != nil {
+		t.Fatalf("Failed to start test server: %v", err)
 	}
-	defer listener.Close()
-
-	go func() {
-		for {
-			conn, err := listener.Accept()
-			if err != nil {
-				return
-			}
-			go proxy.HandleConnection(conn)
-		}
-	}()
+	defer server.Stop()
 
 	// Test connection through proxy
-	conn, err := net.Dial("tcp", "localhost:27018")
+	conn, err := net.Dial("tcp", server.GetAddr())
 	if err != nil {
 		t.Fatalf("Failed to connect to proxy: %v", err)
 	}
@@ -388,24 +370,15 @@ func TestCassandraProxy(t *testing.T) {
 		EnableTLS: false,
 	}
 
-	listener, err := net.Listen("tcp", "localhost:19042")
-	if err != nil {
-		t.Fatalf("Failed to create listener: %v", err)
+	// Use TestServer for proper resource management
+	server := NewTestServer("localhost:19042", HandlerFunc(proxy.HandleConnection), 50)
+	if err := server.Start(); err != nil {
+		t.Fatalf("Failed to start test server: %v", err)
 	}
-	defer listener.Close()
-
-	go func() {
-		for {
-			conn, err := listener.Accept()
-			if err != nil {
-				return
-			}
-			go proxy.HandleConnection(conn)
-		}
-	}()
+	defer server.Stop()
 
 	// Test connection through proxy
-	conn, err := net.Dial("tcp", "localhost:19042")
+	conn, err := net.Dial("tcp", server.GetAddr())
 	if err != nil {
 		t.Fatalf("Failed to connect to proxy: %v", err)
 	}
@@ -454,28 +427,19 @@ func TestProxyFailover(t *testing.T) {
 	})
 
 	t.Run("ConnectionTimeout", func(t *testing.T) {
-		// Create a listener that accepts but never responds
-		backend, err := net.Listen("tcp", "localhost:15434")
-		if err != nil {
-			t.Fatalf("Failed to create backend listener: %v", err)
+		// Create a test server with delayed response
+		server := NewTestServer("localhost:15434", DelayedBackend(10*time.Second), 10)
+		if err := server.Start(); err != nil {
+			t.Fatalf("Failed to start test server: %v", err)
 		}
-		defer backend.Close()
-
-		go func() {
-			conn, _ := backend.Accept()
-			if conn != nil {
-				// Accept but don't respond
-				time.Sleep(10 * time.Second)
-				conn.Close()
-			}
-		}()
+		defer server.Stop()
 
 		// Test timeout handling
 		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 		defer cancel()
 
 		d := net.Dialer{Timeout: 1 * time.Second}
-		conn, err := d.DialContext(ctx, "tcp", "localhost:15434")
+		conn, err := d.DialContext(ctx, "tcp", server.GetAddr())
 		if err != nil {
 			// This is expected in some cases
 			return
