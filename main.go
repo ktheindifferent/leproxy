@@ -135,12 +135,13 @@ func run(args runArgs) error {
 	}
 	
 	// Initialize tracing if configured
+	var tracerProvider *tracing.TracerProvider
 	if args.TracingEndpoint != "" {
 		tracer, err := tracing.InitTracer("leproxy", args.TracingEndpoint, args.TracingExporter)
 		if err != nil {
 			logger.Warn("Failed to initialize tracing", "error", err)
 		} else {
-			defer tracer.Shutdown(context.Background())
+			tracerProvider = tracer
 			logger.Info("Tracing initialized", "endpoint", args.TracingEndpoint, "exporter", args.TracingExporter)
 		}
 	}
@@ -189,9 +190,9 @@ func run(args runArgs) error {
 		return errors.Wrap(err, errors.ErrConnection, "failed to start HTTP redirect server")
 	}
 	
-	// Set up graceful shutdown
-	shutdownManager := graceful.NewShutdownManager(srv)
-	go shutdownManager.HandleSignals()
+	// Set up graceful shutdown with coordinator
+	shutdownCoordinator := setupGracefulShutdownCoordinator(srv, tracerProvider)
+	go shutdownCoordinator.HandleSignals()
 
 	return startHTTPSServer(srv, args.Idle)
 }
@@ -1118,4 +1119,40 @@ func setBackendConfig(config *dbProxyConfig, parts []string) {
 	} else {
 		config.Backend = parts[3]
 	}
+}
+
+// setupGracefulShutdownCoordinator configures graceful shutdown for the server and all resources
+func setupGracefulShutdownCoordinator(srv *http.Server, tracerProvider *tracing.TracerProvider) *graceful.ShutdownCoordinator {
+	// Create graceful server configuration
+	cfg := graceful.Config{
+		HTTPServer:      srv,
+		ShutdownTimeout: 30 * time.Second,
+		ReloadFunc:      nil, // Can be added later for configuration reload
+	}
+	
+	// Create graceful server
+	gracefulServer := graceful.New(cfg)
+	
+	// Create shutdown coordinator
+	coordinator := graceful.NewShutdownCoordinator(gracefulServer, 30*time.Second)
+	
+	// Add tracer shutdown if configured
+	if tracerProvider != nil {
+		coordinator.AddShutdownFunc(
+			"tracer",
+			func(ctx context.Context) error {
+				if err := tracerProvider.Shutdown(ctx); err != nil {
+					logger.Error("Failed to shutdown tracer provider", map[string]interface{}{"error": err})
+					return err
+				}
+				logger.Info("Tracer provider shutdown successfully")
+				return nil
+			},
+			5*time.Second, // 5 second timeout for tracer shutdown
+		)
+	}
+	
+	// TODO: Add other resource shutdowns here (metrics server, health server, etc.)
+	
+	return coordinator
 }
