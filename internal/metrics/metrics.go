@@ -49,6 +49,17 @@ func NewRegistry() *Registry {
 	}
 }
 
+// DefaultRegistry returns the default metrics registry
+func DefaultRegistry() *Registry {
+	return defaultRegistry
+}
+
+// IsEnabled returns true if metrics collection is enabled
+func IsEnabled() bool {
+	// You can make this configurable via environment variable or config
+	return true
+}
+
 func (r *Registry) Register(name string, metricType MetricType, help string) *Metric {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -326,11 +337,6 @@ func RecordCertificateRenewal(domain string, success bool) {
 		"success": strconv.FormatBool(success),
 	}
 	CertificateRenewalsTotal.WithLabels(labels).Inc()
-}
-
-// Default registry functions
-func DefaultRegistry() *Registry {
-	return defaultRegistry
 }
 
 func Register(name string, metricType MetricType, help string) *Metric {

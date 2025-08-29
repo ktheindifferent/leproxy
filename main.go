@@ -193,6 +193,9 @@ func run(args runArgs) error {
 	// Set up graceful shutdown with coordinator
 	shutdownCoordinator := setupGracefulShutdownCoordinator(srv, tracerProvider)
 	go shutdownCoordinator.HandleSignals()
+	
+	// Register shutdown hooks for external components if needed
+	registerShutdownHooks(shutdownCoordinator, args)
 
 	return startHTTPSServer(srv, args.Idle)
 }
@@ -295,6 +298,49 @@ func serveWithCustomListener(srv *http.Server, idleTimeout time.Duration) error 
 	}
 	
 	return srv.ServeTLS(keepAliveListener, "", "")
+}
+
+// setupGracefulShutdown creates and configures the graceful shutdown server
+func setupGracefulShutdown(httpServer *http.Server, args runArgs) *graceful.Server {
+	cfg := graceful.Config{
+		HTTPServer:      httpServer,
+		ShutdownTimeout: 30 * time.Second,
+		EnableProgress:  args.LogLevel == "debug", // Enable progress in debug mode
+		ReloadFunc: func() error {
+			// Reload configuration logic
+			logger.Info("Reloading configuration", nil)
+			// TODO: Implement actual configuration reload
+			return nil
+		},
+	}
+	
+	return graceful.New(cfg)
+}
+
+// registerShutdownHooks registers shutdown hooks for various components
+func registerShutdownHooks(coordinator *graceful.ShutdownCoordinator, args runArgs) {
+	// Register pool shutdown hooks
+	coordinator.AddShutdownFunc("connection-pools", func(ctx context.Context) error {
+		// TODO: Shutdown connection pools
+		logger.Info("Shutting down connection pools", nil)
+		return nil
+	}, 5*time.Second)
+	
+	// Register metrics server shutdown if enabled
+	if args.MetricsAddr != "" {
+		coordinator.AddShutdownFunc("metrics-server", func(ctx context.Context) error {
+			logger.Info("Shutting down metrics server", nil)
+			// TODO: Implement metrics server shutdown
+			return nil
+		}, 5*time.Second)
+	}
+	
+	// Register cleanup for certificate cache
+	coordinator.AddShutdownFunc("certificate-cache", func(ctx context.Context) error {
+		logger.Info("Cleaning up certificate cache", nil)
+		// TODO: Implement certificate cache cleanup if needed
+		return nil
+	}, 5*time.Second)
 }
 
 func createTCPListener(addr string) (*net.TCPListener, error) {
