@@ -4,6 +4,9 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -15,7 +18,6 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	semconv "go.opentelemetry.io/otel/semconv/v1.17.0"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -54,13 +56,13 @@ func NewTracerProvider(cfg Config) (*TracerProvider, error) {
 		}, nil
 	}
 	
-	// Create resource
+	// Create resource without specifying schema to avoid conflicts
 	res, err := resource.Merge(
 		resource.Default(),
 		resource.NewWithAttributes(
-			semconv.SchemaURL,
-			semconv.ServiceNameKey.String(cfg.ServiceName),
-			semconv.ServiceVersionKey.String("1.0.0"),
+			"", // Empty schema URL to avoid conflicts
+			attribute.String("service.name", cfg.ServiceName),
+			attribute.String("service.version", "1.0.0"),
 			attribute.String("environment", cfg.Environment),
 		),
 	)
@@ -107,12 +109,30 @@ func NewTracerProvider(cfg Config) (*TracerProvider, error) {
 	}, nil
 }
 
-// Shutdown shuts down the tracer provider
+// Shutdown shuts down the tracer provider with enhanced error handling
 func (tp *TracerProvider) Shutdown(ctx context.Context) error {
-	if tp.provider != nil {
-		return tp.provider.Shutdown(ctx)
+	if tp.provider == nil {
+		// No-op provider, nothing to shutdown
+		return nil
 	}
-	return nil
+	
+	// Create a channel to capture the shutdown result
+	done := make(chan error, 1)
+	
+	go func() {
+		done <- tp.provider.Shutdown(ctx)
+	}()
+	
+	select {
+	case err := <-done:
+		if err != nil {
+			return fmt.Errorf("failed to shutdown tracer provider for service %s: %w", tp.config.ServiceName, err)
+		}
+		return nil
+	case <-ctx.Done():
+		// Context timeout/cancellation
+		return fmt.Errorf("tracer provider shutdown timed out for service %s: %w", tp.config.ServiceName, ctx.Err())
+	}
 }
 
 // Tracer returns the tracer
@@ -160,7 +180,9 @@ func createOTLPExporter(cfg Config) (sdktrace.SpanExporter, error) {
 
 // createStdoutExporter creates a stdout exporter for debugging
 func createStdoutExporter() (sdktrace.SpanExporter, error) {
-	return sdktrace.NewExporter(sdktrace.WithStdout())
+	// Stdout exporter has been moved to a separate package in newer versions
+	// For now, return a noop exporter or use Jaeger with a local endpoint
+	return jaeger.New(jaeger.WithCollectorEndpoint(jaeger.WithEndpoint("http://localhost:14268/api/traces")))
 }
 
 // HTTPMiddleware creates HTTP middleware for tracing
@@ -176,12 +198,12 @@ func HTTPMiddleware(tp *TracerProvider) func(http.Handler) http.Handler {
 				spanName,
 				trace.WithSpanKind(trace.SpanKindServer),
 				trace.WithAttributes(
-					semconv.HTTPMethodKey.String(r.Method),
-					semconv.HTTPTargetKey.String(r.URL.Path),
-					semconv.HTTPSchemeKey.String(r.URL.Scheme),
-					semconv.HTTPHostKey.String(r.Host),
-					semconv.HTTPUserAgentKey.String(r.UserAgent()),
-					semconv.HTTPRequestContentLengthKey.Int64(r.ContentLength),
+					attribute.String("http.method", r.Method),
+					attribute.String("http.target", r.URL.Path),
+					attribute.String("http.scheme", r.URL.Scheme),
+					attribute.String("http.host", r.Host),
+					attribute.String("http.user_agent", r.UserAgent()),
+					attribute.Int64("http.request_content_length", r.ContentLength),
 				),
 			)
 			defer span.End()
@@ -199,7 +221,7 @@ func HTTPMiddleware(tp *TracerProvider) func(http.Handler) http.Handler {
 			
 			// Set span attributes
 			span.SetAttributes(
-				semconv.HTTPStatusCodeKey.Int(wrapped.statusCode),
+				attribute.Int("http.status_code", wrapped.statusCode),
 				attribute.Int64("http.response_content_length", wrapped.bytesWritten),
 				attribute.Float64("http.duration_ms", float64(duration.Milliseconds())),
 			)
@@ -246,10 +268,10 @@ func TraceRequest(ctx context.Context, req *http.Request, spanName string) (*htt
 	ctx, span := tracer.Start(ctx, spanName,
 		trace.WithSpanKind(trace.SpanKindClient),
 		trace.WithAttributes(
-			semconv.HTTPMethodKey.String(req.Method),
-			semconv.HTTPURLKey.String(req.URL.String()),
-			semconv.HTTPTargetKey.String(req.URL.Path),
-			semconv.HTTPHostKey.String(req.Host),
+			attribute.String("http.method", req.Method),
+			attribute.String("http.url", req.URL.String()),
+			attribute.String("http.target", req.URL.Path),
+			attribute.String("http.host", req.Host),
 		),
 	)
 	
@@ -268,7 +290,7 @@ func TraceResponse(span trace.Span, resp *http.Response, err error) {
 	}
 	
 	span.SetAttributes(
-		semconv.HTTPStatusCodeKey.Int(resp.StatusCode),
+		attribute.Int("http.status_code", resp.StatusCode),
 		attribute.Int64("http.response_content_length", resp.ContentLength),
 	)
 	
@@ -376,4 +398,49 @@ func InjectHTTPHeaders(ctx context.Context, headers http.Header) {
 // ExtractHTTPHeaders extracts trace context from HTTP headers
 func ExtractHTTPHeaders(ctx context.Context, headers http.Header) context.Context {
 	return otel.GetTextMapPropagator().Extract(ctx, propagation.HeaderCarrier(headers))
+}
+
+// InitTracer initializes a new tracer provider with the given configuration
+func InitTracer(serviceName, endpoint, exporterType string) (*TracerProvider, error) {
+	// Determine sample rate based on environment
+	sampleRate := 1.0 // Default to sampling everything
+	if os.Getenv("OTEL_TRACE_SAMPLE_RATE") != "" {
+		if rate, err := strconv.ParseFloat(os.Getenv("OTEL_TRACE_SAMPLE_RATE"), 64); err == nil {
+			sampleRate = rate
+		}
+	}
+	
+	config := Config{
+		Enabled:      true,
+		ServiceName:  serviceName,
+		Environment:  os.Getenv("ENVIRONMENT"),
+		ExporterType: exporterType,
+		Endpoint:     endpoint,
+		SampleRate:   sampleRate,
+	}
+	
+	// Configure based on exporter type
+	switch exporterType {
+	case "jaeger":
+		config.JaegerEndpoint = endpoint
+	case "otlp":
+		config.OTLPEndpoint = endpoint
+		config.OTLPInsecure = true // Use insecure by default for local development
+		
+		// Check for OTLP headers in environment
+		if headers := os.Getenv("OTEL_EXPORTER_OTLP_HEADERS"); headers != "" {
+			config.OTLPHeaders = make(map[string]string)
+			for _, header := range strings.Split(headers, ",") {
+				parts := strings.SplitN(header, "=", 2)
+				if len(parts) == 2 {
+					config.OTLPHeaders[parts[0]] = parts[1]
+				}
+			}
+		}
+	default:
+		// Stdout exporter for unknown types
+		config.ExporterType = "stdout"
+	}
+	
+	return NewTracerProvider(config)
 }

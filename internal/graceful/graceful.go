@@ -792,3 +792,123 @@ func (m *Manager) HandleSignals() {
 		}
 	}
 }
+
+// ShutdownCoordinator coordinates shutdown of multiple resources
+type ShutdownCoordinator struct {
+	server         *Server
+	shutdownFuncs  []ShutdownFunc
+	mu             sync.Mutex
+	shutdownTimeout time.Duration
+}
+
+// ShutdownFunc represents a function to be called during shutdown
+type ShutdownFunc struct {
+	Name     string
+	Fn       func(context.Context) error
+	Timeout  time.Duration
+}
+
+// NewShutdownCoordinator creates a new shutdown coordinator
+func NewShutdownCoordinator(server *Server, timeout time.Duration) *ShutdownCoordinator {
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	return &ShutdownCoordinator{
+		server:          server,
+		shutdownFuncs:   make([]ShutdownFunc, 0),
+		shutdownTimeout: timeout,
+	}
+}
+
+// AddShutdownFunc adds a shutdown function to be called during graceful shutdown
+func (sc *ShutdownCoordinator) AddShutdownFunc(name string, fn func(context.Context) error, timeout time.Duration) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	
+	sc.shutdownFuncs = append(sc.shutdownFuncs, ShutdownFunc{
+		Name:    name,
+		Fn:      fn,
+		Timeout: timeout,
+	})
+}
+
+// Shutdown performs coordinated shutdown of all resources
+func (sc *ShutdownCoordinator) Shutdown(ctx context.Context) error {
+	// First shutdown the HTTP server
+	serverErr := sc.server.Shutdown(ctx)
+	
+	// Then shutdown additional resources in parallel
+	sc.mu.Lock()
+	funcs := make([]ShutdownFunc, len(sc.shutdownFuncs))
+	copy(funcs, sc.shutdownFuncs)
+	sc.mu.Unlock()
+	
+	var wg sync.WaitGroup
+	errChan := make(chan error, len(funcs))
+	
+	for _, sf := range funcs {
+		wg.Add(1)
+		go func(shutdownFunc ShutdownFunc) {
+			defer wg.Done()
+			
+			// Create context with specific timeout for this resource
+			fnCtx, cancel := context.WithTimeout(context.Background(), shutdownFunc.Timeout)
+			defer cancel()
+			
+			// Execute shutdown function
+			if err := shutdownFunc.Fn(fnCtx); err != nil {
+				errChan <- fmt.Errorf("%s shutdown failed: %w", shutdownFunc.Name, err)
+			}
+		}(sf)
+	}
+	
+	// Wait for all shutdowns to complete
+	wg.Wait()
+	close(errChan)
+	
+	// Collect all errors
+	var errors []error
+	if serverErr != nil {
+		errors = append(errors, fmt.Errorf("server shutdown failed: %w", serverErr))
+	}
+	
+	for err := range errChan {
+		errors = append(errors, err)
+	}
+	
+	// Return aggregated error if any
+	if len(errors) > 0 {
+		return fmt.Errorf("shutdown errors: %v", errors)
+	}
+	
+	return nil
+}
+
+// HandleSignals handles OS signals for graceful shutdown
+func (sc *ShutdownCoordinator) HandleSignals() {
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	
+	for sig := range sigChan {
+		switch sig {
+		case syscall.SIGINT, syscall.SIGTERM:
+			ctx, cancel := context.WithTimeout(context.Background(), sc.shutdownTimeout)
+			defer cancel()
+			
+			if err := sc.Shutdown(ctx); err != nil {
+				// Log the error (assuming logger is available)
+				fmt.Fprintf(os.Stderr, "Shutdown error: %v\n", err)
+				os.Exit(1)
+			}
+			os.Exit(0)
+			
+		case syscall.SIGHUP:
+			// Reload if server has reload function
+			if sc.server.reloadFunc != nil {
+				if err := sc.server.Reload(); err != nil {
+					fmt.Fprintf(os.Stderr, "Reload error: %v\n", err)
+				}
+			}
+		}
+	}
+}

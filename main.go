@@ -135,12 +135,13 @@ func run(args runArgs) error {
 	}
 	
 	// Initialize tracing if configured
+	var tracerProvider *tracing.TracerProvider
 	if args.TracingEndpoint != "" {
 		tracer, err := tracing.InitTracer("leproxy", args.TracingEndpoint, args.TracingExporter)
 		if err != nil {
 			logger.Warn("Failed to initialize tracing", "error", err)
 		} else {
-			defer tracer.Shutdown(context.Background())
+			tracerProvider = tracer
 			logger.Info("Tracing initialized", "endpoint", args.TracingEndpoint, "exporter", args.TracingExporter)
 		}
 	}
@@ -189,14 +190,12 @@ func run(args runArgs) error {
 		return errors.Wrap(err, errors.ErrConnection, "failed to start HTTP redirect server")
 	}
 	
-	// Set up graceful shutdown with enhanced error handling
-	gracefulServer := setupGracefulShutdown(srv, args)
-	
-	// Start handling signals in a separate goroutine
-	go gracefulServer.HandleSignals()
+	// Set up graceful shutdown with coordinator
+	shutdownCoordinator := setupGracefulShutdownCoordinator(srv, tracerProvider)
+	go shutdownCoordinator.HandleSignals()
 	
 	// Register shutdown hooks for external components if needed
-	registerShutdownHooks(gracefulServer, args)
+	registerShutdownHooks(shutdownCoordinator, args)
 
 	return startHTTPSServer(srv, args.Idle)
 }
@@ -319,53 +318,29 @@ func setupGracefulShutdown(httpServer *http.Server, args runArgs) *graceful.Serv
 }
 
 // registerShutdownHooks registers shutdown hooks for various components
-func registerShutdownHooks(server *graceful.Server, args runArgs) {
+func registerShutdownHooks(coordinator *graceful.ShutdownCoordinator, args runArgs) {
 	// Register pool shutdown hooks
-	server.RegisterShutdownHook(graceful.ShutdownHook{
-		Name:     "connection-pools",
-		Phase:    graceful.PhasePools,
-		Priority: 1,
-		Shutdown: func(ctx context.Context) error {
-			// TODO: Shutdown connection pools
-			logger.Info("Shutting down connection pools", nil)
-			return nil
-		},
-	})
+	coordinator.AddShutdownFunc("connection-pools", func(ctx context.Context) error {
+		// TODO: Shutdown connection pools
+		logger.Info("Shutting down connection pools", nil)
+		return nil
+	}, 5*time.Second)
 	
 	// Register metrics server shutdown if enabled
 	if args.MetricsAddr != "" {
-		server.RegisterShutdownHook(graceful.ShutdownHook{
-			Name:     "metrics-server",
-			Phase:    graceful.PhaseServices,
-			Priority: 10,
-			Shutdown: func(ctx context.Context) error {
-				logger.Info("Shutting down metrics server", nil)
-				// TODO: Implement metrics server shutdown
-				return nil
-			},
-		})
-	}
-	
-	// Register tracing shutdown if enabled
-	if args.TracingEndpoint != "" {
-		server.RegisterShutdownHook(graceful.ShutdownHook{
-			Name:     "tracing",
-			Phase:    graceful.PhaseTracers,
-			Priority: 1,
-			Shutdown: func(ctx context.Context) error {
-				logger.Info("Shutting down tracing", nil)
-				// Tracing shutdown is already handled via defer in run()
-				return nil
-			},
-		})
+		coordinator.AddShutdownFunc("metrics-server", func(ctx context.Context) error {
+			logger.Info("Shutting down metrics server", nil)
+			// TODO: Implement metrics server shutdown
+			return nil
+		}, 5*time.Second)
 	}
 	
 	// Register cleanup for certificate cache
-	server.RegisterCleanup(func() error {
+	coordinator.AddShutdownFunc("certificate-cache", func(ctx context.Context) error {
 		logger.Info("Cleaning up certificate cache", nil)
 		// TODO: Implement certificate cache cleanup if needed
 		return nil
-	})
+	}, 5*time.Second)
 }
 
 func createTCPListener(addr string) (*net.TCPListener, error) {
@@ -1190,4 +1165,40 @@ func setBackendConfig(config *dbProxyConfig, parts []string) {
 	} else {
 		config.Backend = parts[3]
 	}
+}
+
+// setupGracefulShutdownCoordinator configures graceful shutdown for the server and all resources
+func setupGracefulShutdownCoordinator(srv *http.Server, tracerProvider *tracing.TracerProvider) *graceful.ShutdownCoordinator {
+	// Create graceful server configuration
+	cfg := graceful.Config{
+		HTTPServer:      srv,
+		ShutdownTimeout: 30 * time.Second,
+		ReloadFunc:      nil, // Can be added later for configuration reload
+	}
+	
+	// Create graceful server
+	gracefulServer := graceful.New(cfg)
+	
+	// Create shutdown coordinator
+	coordinator := graceful.NewShutdownCoordinator(gracefulServer, 30*time.Second)
+	
+	// Add tracer shutdown if configured
+	if tracerProvider != nil {
+		coordinator.AddShutdownFunc(
+			"tracer",
+			func(ctx context.Context) error {
+				if err := tracerProvider.Shutdown(ctx); err != nil {
+					logger.Error("Failed to shutdown tracer provider", map[string]interface{}{"error": err})
+					return err
+				}
+				logger.Info("Tracer provider shutdown successfully")
+				return nil
+			},
+			5*time.Second, // 5 second timeout for tracer shutdown
+		)
+	}
+	
+	// TODO: Add other resource shutdowns here (metrics server, health server, etc.)
+	
+	return coordinator
 }
