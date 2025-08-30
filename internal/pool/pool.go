@@ -34,9 +34,13 @@ func (pc *PooledConn) Close() error {
 		return nil
 	}
 	
-	// Check if pool is closed BEFORE trying to return connection
-	// This prevents the race condition in the original code
-	if atomic.LoadInt32(&pc.pool.closed) == 1 {
+	// Get pool state with proper locking
+	pc.pool.stateMu.RLock()
+	poolState := pc.pool.state
+	pc.pool.stateMu.RUnlock()
+	
+	// If pool is closing or closed, just close the connection
+	if poolState >= PoolStateClosing {
 		atomic.AddInt32(&pc.pool.activeConns, -1)
 		pc.pool.removeTrackedConn(pc.id)
 		return pc.Conn.Close()
@@ -46,16 +50,7 @@ func (pc *PooledConn) Close() error {
 	if time.Since(pc.createdAt) < pc.pool.maxLifetime {
 		pc.lastUsed = time.Now()
 		
-		// Try to return to pool with proper error handling
-		defer func() {
-			if r := recover(); r != nil {
-				// Channel was closed, close the connection
-				atomic.AddInt32(&pc.pool.activeConns, -1)
-				pc.pool.removeTrackedConn(pc.id)
-				pc.Conn.Close()
-			}
-		}()
-		
+		// Try to return to pool - no panic risk as we check state first
 		select {
 		case pc.pool.conns <- pc:
 			// Successfully returned to pool
@@ -87,6 +82,16 @@ func (pc *PooledConn) IsClosed() bool {
 	return atomic.LoadInt32(&pc.closed) == 1
 }
 
+// PoolState represents the current state of the pool
+type PoolState int32
+
+const (
+	PoolStateOpen     PoolState = 0 // Pool is open and accepting connections
+	PoolStateDraining PoolState = 1 // Pool is draining, no new connections
+	PoolStateClosing  PoolState = 2 // Pool is closing, connections being terminated
+	PoolStateClosed   PoolState = 3 // Pool is fully closed
+)
+
 type Pool struct {
 	factory     Factory
 	conns       chan *PooledConn
@@ -95,9 +100,11 @@ type Pool struct {
 	maxLifetime time.Duration
 	idleTimeout time.Duration
 	
+	// State management with proper synchronization
+	stateMu     sync.RWMutex
+	state       PoolState
+	
 	// Atomic fields for thread-safe access
-	closed      int32  // atomic: 0 = open, 1 = closed
-	draining    int32  // atomic: 0 = normal, 1 = draining
 	nextConnID  uint64 // atomic counter for connection IDs
 	
 	// Statistics (all atomic)
@@ -158,6 +165,7 @@ func New(cfg Config) (*Pool, error) {
 		maxConns:     cfg.MaxConns,
 		maxLifetime:  cfg.MaxLifetime,
 		idleTimeout:  cfg.IdleTimeout,
+		state:        PoolStateOpen,
 		closeCh:      make(chan struct{}),
 		trackedConns: make(map[uint64]*PooledConn),
 	}
@@ -185,12 +193,16 @@ func New(cfg Config) (*Pool, error) {
 }
 
 func (p *Pool) Get(ctx context.Context) (net.Conn, error) {
-	// Check if pool is closed or draining
-	if atomic.LoadInt32(&p.closed) == 1 {
+	// Check pool state with proper locking
+	p.stateMu.RLock()
+	state := p.state
+	p.stateMu.RUnlock()
+	
+	if state == PoolStateClosed {
 		return nil, ErrPoolClosed
 	}
 	
-	if atomic.LoadInt32(&p.draining) == 1 {
+	if state == PoolStateDraining || state == PoolStateClosing {
 		return nil, ErrPoolDraining
 	}
 	
@@ -260,8 +272,12 @@ func (p *Pool) Get(ctx context.Context) (net.Conn, error) {
 }
 
 func (p *Pool) createConn(ctx context.Context) (*PooledConn, error) {
-	// Check if we're closing
-	if atomic.LoadInt32(&p.closed) == 1 {
+	// Check pool state
+	p.stateMu.RLock()
+	state := p.state
+	p.stateMu.RUnlock()
+	
+	if state >= PoolStateClosing {
 		return nil, ErrPoolClosed
 	}
 	
@@ -345,7 +361,11 @@ func (p *Pool) cleanupLoop() {
 
 func (p *Pool) cleanup() {
 	// Don't cleanup if we're closing
-	if atomic.LoadInt32(&p.closed) == 1 {
+	p.stateMu.RLock()
+	state := p.state
+	p.stateMu.RUnlock()
+	
+	if state >= PoolStateClosing {
 		return
 	}
 	
@@ -387,7 +407,11 @@ check:
 	atomic.StoreInt32(&p.idleConns, int32(healthy))
 	
 	// Ensure minimum connections
-	if healthy < p.minConns && atomic.LoadInt32(&p.closed) == 0 {
+	p.stateMu.RLock()
+	poolOpen := p.state == PoolStateOpen
+	p.stateMu.RUnlock()
+	
+	if healthy < p.minConns && poolOpen {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		
@@ -410,14 +434,22 @@ check:
 
 // Drain starts draining the pool, preventing new connections
 func (p *Pool) Drain() {
-	atomic.StoreInt32(&p.draining, 1)
+	p.stateMu.Lock()
+	if p.state == PoolStateOpen {
+		p.state = PoolStateDraining
+	}
+	p.stateMu.Unlock()
 }
 
 // Close closes the pool and all its connections
 func (p *Pool) Close() error {
+	var closeErr error
+	
 	p.closeOnce.Do(func() {
-		// Mark as closed first to prevent new operations
-		atomic.StoreInt32(&p.closed, 1)
+		// Transition to closing state
+		p.stateMu.Lock()
+		p.state = PoolStateClosing
+		p.stateMu.Unlock()
 		
 		// Signal cleanup goroutine to stop
 		close(p.closeCh)
@@ -425,8 +457,8 @@ func (p *Pool) Close() error {
 		// Wait for cleanup goroutine to finish
 		p.wg.Wait()
 		
-		// Drain all idle connections without closing the channel yet
-		// This prevents the race condition
+		// Drain all idle connections
+		// Safe to do as we've set state to closing, so no new connections will be added
 		for {
 			select {
 			case conn := <-p.conns:
@@ -442,13 +474,26 @@ func (p *Pool) Close() error {
 		// Force close any remaining tracked connections (potential leaks)
 		p.trackMu.Lock()
 		for id, conn := range p.trackedConns {
+			// Only decrement active count if connection is not already closed
+			if atomic.LoadInt32(&conn.closed) == 0 {
+				atomic.AddInt32(&p.activeConns, -1)
+			}
 			conn.MarkUnhealthy()
 			delete(p.trackedConns, id)
 		}
 		p.trackMu.Unlock()
+		
+		// Reset counters for clean state
+		atomic.StoreInt32(&p.activeConns, 0)
+		atomic.StoreInt32(&p.idleConns, 0)
+		
+		// Finally transition to closed state
+		p.stateMu.Lock()
+		p.state = PoolStateClosed
+		p.stateMu.Unlock()
 	})
 	
-	return nil
+	return closeErr
 }
 
 // WaitForDrain waits for all active connections to be returned
@@ -466,6 +511,13 @@ func (p *Pool) WaitForDrain(timeout time.Duration) error {
 		atomic.LoadInt32(&p.activeConns))
 }
 
+// GetState returns the current pool state
+func (p *Pool) GetState() PoolState {
+	p.stateMu.RLock()
+	defer p.stateMu.RUnlock()
+	return p.state
+}
+
 func (p *Pool) Stats() PoolStats {
 	return PoolStats{
 		Created:  atomic.LoadUint64(&p.totalCreated),
@@ -479,6 +531,16 @@ func (p *Pool) Stats() PoolStats {
 
 // GetLeakedConnections returns connections that are currently active (not returned to pool)
 func (p *Pool) GetLeakedConnections() []*PooledConn {
+	// Check pool state first
+	p.stateMu.RLock()
+	state := p.state
+	p.stateMu.RUnlock()
+	
+	// If pool is closed, there should be no leaked connections
+	if state == PoolStateClosed {
+		return nil
+	}
+	
 	// Simply return the count of active connections
 	// These are connections that have been gotten from the pool but not yet returned
 	activeCount := atomic.LoadInt32(&p.activeConns)
@@ -529,6 +591,14 @@ func (pm *PoolManager) GetPool(key string, cfg Config) (*Pool, error) {
 	pm.mu.RUnlock()
 	
 	if exists {
+		// Check if the pool itself is closed
+		pool.stateMu.RLock()
+		state := pool.state
+		pool.stateMu.RUnlock()
+		
+		if state == PoolStateClosed {
+			return nil, ErrPoolClosed
+		}
 		return pool, nil
 	}
 	
