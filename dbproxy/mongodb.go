@@ -3,9 +3,12 @@ package dbproxy
 import (
 	"crypto/tls"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"log"
 	"net"
+	
+	"github.com/artyom/leproxy/internal/safegoroutine"
 )
 
 type MongoDBProxy struct {
@@ -80,18 +83,20 @@ func (p *MongoDBProxy) handleConnection(clientConn net.Conn) {
 	// Check if we need to handle isMaster command for TLS negotiation
 	if p.EnableTLS {
 		// MongoDB wire protocol detection
-		go p.handleWireProtocol(clientConn, backendConn)
+		safegoroutine.Go(fmt.Sprintf("mongodb-wire-protocol-%s", clientConn.RemoteAddr()), func() {
+			p.handleWireProtocol(clientConn, backendConn)
+		})
 	} else {
 		// Simple TCP proxy
 		errCh := make(chan error, 2)
-		go func() {
+		safegoroutine.Go(fmt.Sprintf("mongodb-to-backend-%s", clientConn.RemoteAddr()), func() {
 			_, err := io.Copy(backendConn, clientConn)
 			errCh <- err
-		}()
-		go func() {
+		})
+		safegoroutine.Go(fmt.Sprintf("mongodb-to-client-%s", clientConn.RemoteAddr()), func() {
 			_, err := io.Copy(clientConn, backendConn)
 			errCh <- err
-		}()
+		})
 
 		// Wait for either direction to finish
 		<-errCh
@@ -105,7 +110,7 @@ func (p *MongoDBProxy) handleWireProtocol(clientConn, backendConn net.Conn) {
 	errCh := make(chan error, 2)
 	
 	// Client to backend
-	go func() {
+	safegoroutine.Go(fmt.Sprintf("mongodb-client-backend-%s", clientConn.RemoteAddr()), func() {
 		for {
 			// Read MongoDB message header (16 bytes)
 			header := make([]byte, 16)
@@ -149,13 +154,13 @@ func (p *MongoDBProxy) handleWireProtocol(clientConn, backendConn net.Conn) {
 				}
 			}
 		}
-	}()
+	})
 	
 	// Backend to client (simpler, just forward)
-	go func() {
+	safegoroutine.Go(fmt.Sprintf("mongodb-backend-client-%s", clientConn.RemoteAddr()), func() {
 		_, err := io.Copy(clientConn, backendConn)
 		errCh <- err
-	}()
+	})
 
 	// Wait for either direction to finish
 	<-errCh

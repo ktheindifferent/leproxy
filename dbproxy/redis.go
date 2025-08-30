@@ -3,10 +3,13 @@ package dbproxy
 import (
 	"bufio"
 	"crypto/tls"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"strings"
+	
+	"github.com/artyom/leproxy/internal/safegoroutine"
 )
 
 type RedisProxy struct {
@@ -94,17 +97,17 @@ func (p *RedisProxy) handleConnection(clientConn net.Conn) {
 		// For connections that used a reader, we need to handle buffered data
 		if clientReader != nil {
 			errCh := make(chan error, 2)
-			go func() {
+			safegoroutine.Go(fmt.Sprintf("redis-proxy-reader-%s", clientConn.RemoteAddr()), func() {
 				err := p.proxyWithReader(clientReader, clientConn, backendConn)
 				errCh <- err
-			}()
-			go func() {
+			})
+			safegoroutine.Go(fmt.Sprintf("redis-proxy-backend-%s", clientConn.RemoteAddr()), func() {
 				_, err := io.Copy(clientConn, backendConn)
 				if err != nil && err != io.EOF {
 					log.Printf("Error copying from backend to client: %v", err)
 				}
 				errCh <- err
-			}()
+			})
 			
 			// Wait for either direction to finish
 			<-errCh
@@ -114,14 +117,14 @@ func (p *RedisProxy) handleConnection(clientConn net.Conn) {
 
 	// Standard bidirectional copy for non-TLS or after TLS negotiation
 	errCh := make(chan error, 2)
-	go func() {
+	safegoroutine.Go(fmt.Sprintf("redis-copy-to-backend-%s", clientConn.RemoteAddr()), func() {
 		_, err := io.Copy(backendConn, clientConn)
 		errCh <- err
-	}()
-	go func() {
+	})
+	safegoroutine.Go(fmt.Sprintf("redis-copy-to-client-%s", clientConn.RemoteAddr()), func() {
 		_, err := io.Copy(clientConn, backendConn)
 		errCh <- err
-	}()
+	})
 
 	// Wait for either direction to finish
 	<-errCh
