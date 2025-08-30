@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"crypto/tls"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"strings"
@@ -54,17 +53,8 @@ func (p *SMTPProxy) handleConnection(clientConn net.Conn) {
 		backendConn = wrappedBackendConn
 	}
 
-	errc := make(chan error, 2)
-	go func() {
-		_, err := io.Copy(backendConn, clientConn)
-		errc <- err
-	}()
-	go func() {
-		_, err := io.Copy(clientConn, backendConn)
-		errc <- err
-	}()
-
-	<-errc
+	// Use BaseProxy's proxyConnections for proper goroutine management
+	p.BaseProxy.proxyConnections(clientConn, backendConn)
 }
 
 func (p *SMTPProxy) handleSTARTTLS(clientConn, backendConn net.Conn) (net.Conn, net.Conn, error) {

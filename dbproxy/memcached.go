@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"crypto/tls"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"strings"
@@ -55,17 +54,8 @@ func (p *MemcachedProxy) handleConnection(clientConn net.Conn) {
 		}
 	}
 
-	errc := make(chan error, 2)
-	go func() {
-		_, err := io.Copy(wrappedBackendConn, wrappedClientConn)
-		errc <- err
-	}()
-	go func() {
-		_, err := io.Copy(wrappedClientConn, wrappedBackendConn)
-		errc <- err
-	}()
-
-	<-errc
+	// Use BaseProxy's proxyConnections for proper goroutine management
+	p.BaseProxy.proxyConnections(wrappedClientConn, wrappedBackendConn)
 }
 
 func (p *MemcachedProxy) handleMemcachedTLS(clientConn, backendConn net.Conn) (net.Conn, net.Conn, error) {
