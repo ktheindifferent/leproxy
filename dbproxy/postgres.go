@@ -5,38 +5,38 @@ import (
 	"crypto/tls"
 	"encoding/binary"
 	"fmt"
-	"io"
 	"log"
 	"net"
-	"time"
 )
 
 // PostgresProxy handles PostgreSQL protocol proxying with optional TLS support
 type PostgresProxy struct {
-	Backend   string      // Backend PostgreSQL server address (host:port)
-	TLSConfig *tls.Config // TLS configuration for client connections
-	EnableTLS bool        // Whether TLS is enabled for this proxy
+	*BaseProxy
 }
 
 // NewPostgresProxy creates a new PostgreSQL proxy instance
 func NewPostgresProxy(backend string, tlsConfig *tls.Config) *PostgresProxy {
 	return &PostgresProxy{
-		Backend:   backend,
-		TLSConfig: tlsConfig,
-		EnableTLS: tlsConfig != nil,
+		BaseProxy: NewBaseProxy(backend, tlsConfig, &postgresHandler{}),
 	}
 }
 
-// Serve starts accepting and handling PostgreSQL client connections
+// postgresHandler implements ProxyHandler for PostgreSQL
+type postgresHandler struct{}
+
+func (h *postgresHandler) GetProtocolName() string {
+	return "PostgreSQL"
+}
+
+func (h *postgresHandler) HandleProtocolNegotiation(clientConn, backendConn net.Conn) (net.Conn, net.Conn, error) {
+	// For PostgreSQL, we handle SSL negotiation if needed
+	// The base proxy will handle TLS if configured
+	return clientConn, backendConn, nil
+}
+
+// Serve delegates to BaseProxy.Serve
 func (p *PostgresProxy) Serve(listener net.Listener) error {
-	for {
-		clientConn, err := listener.Accept()
-		if err != nil {
-			return fmt.Errorf("failed to accept connection: %w", err)
-		}
-		// Handle each connection in a separate goroutine
-		go p.handleConnection(clientConn)
-	}
+	return p.BaseProxy.Serve(listener)
 }
 
 // handleConnection manages a single client connection to the PostgreSQL backend
@@ -58,25 +58,8 @@ func (p *PostgresProxy) handleConnection(clientConn net.Conn) {
 		}
 	}
 
-	p.proxyConnections(clientConn, backendConn)
-}
-
-func (p *PostgresProxy) connectToBackend() (net.Conn, error) {
-	return net.DialTimeout("tcp", p.Backend, 10*time.Second)
-}
-
-func (p *PostgresProxy) proxyConnections(clientConn, backendConn net.Conn) {
-	errChan := make(chan error, 2)
-	
-	copyData := func(dst, src net.Conn) {
-		_, err := io.Copy(dst, src)
-		errChan <- err
-	}
-	
-	go copyData(backendConn, clientConn)
-	go copyData(clientConn, backendConn)
-	
-	<-errChan
+	// Use the BaseProxy's timeout-aware proxy connections
+	p.BaseProxy.proxyConnections(clientConn, backendConn)
 }
 
 // handleSSLNegotiation manages the PostgreSQL SSL negotiation protocol

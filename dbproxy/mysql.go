@@ -4,41 +4,40 @@ import (
 	"bytes"
 	"crypto/tls"
 	"encoding/binary"
-	"fmt"
-	"io"
 	"log"
 	"net"
-	"time"
 )
 
 type MySQLProxy struct {
-	Backend   string
-	TLSConfig *tls.Config
-	EnableTLS bool
+	*BaseProxy
 }
 
 func NewMySQLProxy(backend string, tlsConfig *tls.Config) *MySQLProxy {
 	return &MySQLProxy{
-		Backend:   backend,
-		TLSConfig: tlsConfig,
-		EnableTLS: tlsConfig != nil,
+		BaseProxy: NewBaseProxy(backend, tlsConfig, &mysqlHandler{}),
 	}
 }
 
+// mysqlHandler implements ProxyHandler for MySQL
+type mysqlHandler struct{}
+
+func (h *mysqlHandler) GetProtocolName() string {
+	return "MySQL"
+}
+
+func (h *mysqlHandler) HandleProtocolNegotiation(clientConn, backendConn net.Conn) (net.Conn, net.Conn, error) {
+	// MySQL handles its own SSL negotiation during the connection handshake
+	return clientConn, backendConn, nil
+}
+
 func (p *MySQLProxy) Serve(listener net.Listener) error {
-	for {
-		clientConn, err := listener.Accept()
-		if err != nil {
-			return fmt.Errorf("failed to accept connection: %w", err)
-		}
-		go p.handleConnection(clientConn)
-	}
+	return p.BaseProxy.Serve(listener)
 }
 
 func (p *MySQLProxy) handleConnection(clientConn net.Conn) {
 	defer clientConn.Close()
 
-	backendConn, err := net.DialTimeout("tcp", p.Backend, 10*time.Second)
+	backendConn, err := p.connectToBackend()
 	if err != nil {
 		log.Printf("Failed to connect to MySQL backend %s: %v", p.Backend, err)
 		return
@@ -92,19 +91,8 @@ func (p *MySQLProxy) handleConnection(clientConn net.Conn) {
 		}
 	}
 
-	// Proxy the connection
-	errCh := make(chan error, 2)
-	go func() {
-		_, err := io.Copy(backendConn, clientConn)
-		errCh <- err
-	}()
-	go func() {
-		_, err := io.Copy(clientConn, backendConn)
-		errCh <- err
-	}()
-
-	// Wait for either direction to finish
-	<-errCh
+	// Use BaseProxy's timeout-aware proxy connections
+	p.BaseProxy.proxyConnections(clientConn, backendConn)
 }
 
 func (p *MySQLProxy) supportsSSL(handshake []byte) bool {

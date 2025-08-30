@@ -3,37 +3,35 @@ package dbproxy
 import (
 	"crypto/tls"
 	"encoding/binary"
-	"fmt"
 	"io"
 	"log"
 	"net"
-	"time"
 )
 
 type MongoDBProxy struct {
-	Backend   string
-	TLSConfig *tls.Config
-	EnableTLS bool
+	*BaseProxy
 }
 
 func NewMongoDBProxy(backend string, tlsConfig *tls.Config) *MongoDBProxy {
 	return &MongoDBProxy{
-		Backend:   backend,
-		TLSConfig: tlsConfig,
-		EnableTLS: tlsConfig != nil,
+		BaseProxy: NewBaseProxy(backend, tlsConfig, &mongodbHandler{}),
 	}
+}
+
+// mongodbHandler implements ProxyHandler for MongoDB
+type mongodbHandler struct{}
+
+func (h *mongodbHandler) GetProtocolName() string {
+	return "MongoDB"
+}
+
+func (h *mongodbHandler) HandleProtocolNegotiation(clientConn, backendConn net.Conn) (net.Conn, net.Conn, error) {
+	return clientConn, backendConn, nil
 }
 
 func (p *MongoDBProxy) Serve(listener net.Listener) error {
-	for {
-		clientConn, err := listener.Accept()
-		if err != nil {
-			return fmt.Errorf("failed to accept connection: %w", err)
-		}
-		go p.handleConnection(clientConn)
-	}
+	return p.BaseProxy.Serve(listener)
 }
-
 func (p *MongoDBProxy) handleConnection(clientConn net.Conn) {
 	defer clientConn.Close()
 
@@ -72,7 +70,7 @@ func (p *MongoDBProxy) handleConnection(clientConn net.Conn) {
 	}
 
 	// Connect to backend
-	backendConn, err := net.DialTimeout("tcp", p.Backend, 10*time.Second)
+	backendConn, err := p.connectToBackend()
 	if err != nil {
 		log.Printf("Failed to connect to MongoDB backend %s: %v", p.Backend, err)
 		return

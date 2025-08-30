@@ -6,37 +6,36 @@ import (
 	"io"
 	"log"
 	"net"
-	"time"
 )
 
 type MSSQLProxy struct {
-	Backend    string
-	TLSConfig  *tls.Config
-	EnableTLS  bool
+	*BaseProxy
 }
 
 func NewMSSQLProxy(backend string, tlsConfig *tls.Config) *MSSQLProxy {
 	return &MSSQLProxy{
-		Backend:   backend,
-		TLSConfig: tlsConfig,
-		EnableTLS: tlsConfig != nil,
+		BaseProxy: NewBaseProxy(backend, tlsConfig, &mssqlHandler{}),
 	}
+}
+
+// mssqlHandler implements ProxyHandler for MSSQL
+type mssqlHandler struct{}
+
+func (h *mssqlHandler) GetProtocolName() string {
+	return "MSSQL"
+}
+
+func (h *mssqlHandler) HandleProtocolNegotiation(clientConn, backendConn net.Conn) (net.Conn, net.Conn, error) {
+	return clientConn, backendConn, nil
 }
 
 func (p *MSSQLProxy) Serve(listener net.Listener) error {
-	for {
-		clientConn, err := listener.Accept()
-		if err != nil {
-			return fmt.Errorf("failed to accept connection: %w", err)
-		}
-		go p.handleConnection(clientConn)
-	}
+	return p.BaseProxy.Serve(listener)
 }
-
 func (p *MSSQLProxy) handleConnection(clientConn net.Conn) {
 	defer clientConn.Close()
 
-	backendConn, err := net.DialTimeout("tcp", p.Backend, 10*time.Second)
+	backendConn, err := p.connectToBackend()
 	if err != nil {
 		log.Printf("Failed to connect to MSSQL backend %s: %v", p.Backend, err)
 		return

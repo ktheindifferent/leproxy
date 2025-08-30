@@ -265,6 +265,18 @@ var (
 		MetricTypeCounter,
 		"Total number of errors by type",
 	)
+	
+	ProxyTimeoutsTotal = defaultRegistry.Register(
+		"proxy_timeouts_total",
+		MetricTypeCounter,
+		"Total number of proxy timeouts by type",
+	)
+	
+	ProxyRetriesTotal = defaultRegistry.Register(
+		"proxy_retries_total",
+		MetricTypeCounter,
+		"Total number of proxy operation retries",
+	)
 )
 
 // Middleware for HTTP metrics
@@ -349,4 +361,23 @@ func Get(name string) *Metric {
 
 func Handler() http.HandlerFunc {
 	return defaultRegistry.Handler()
+}
+
+// RecordTimeout records proxy timeout metrics
+func RecordTimeout(proxyType string, timeoutType string, direction string) {
+	labels := map[string]string{
+		"proxy_type":   proxyType,
+		"timeout_type": timeoutType,
+		"direction":    direction,
+	}
+	ProxyTimeoutsTotal.WithLabels(labels).Inc()
+}
+
+// RecordRetry records proxy retry metrics
+func RecordRetry(proxyType string, direction string) {
+	labels := map[string]string{
+		"proxy_type": proxyType,
+		"direction":  direction,
+	}
+	ProxyRetriesTotal.WithLabels(labels).Inc()
 }

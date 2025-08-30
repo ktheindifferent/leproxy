@@ -8,37 +8,36 @@ import (
 	"log"
 	"net"
 	"strings"
-	"time"
 )
 
 type FTPProxy struct {
-	Backend   string
-	TLSConfig *tls.Config
-	EnableTLS bool
+	*BaseProxy
 }
 
 func NewFTPProxy(backend string, tlsConfig *tls.Config) *FTPProxy {
 	return &FTPProxy{
-		Backend:   backend,
-		TLSConfig: tlsConfig,
-		EnableTLS: tlsConfig != nil,
+		BaseProxy: NewBaseProxy(backend, tlsConfig, &ftpHandler{}),
 	}
+}
+
+// ftpHandler implements ProxyHandler for FTP
+type ftpHandler struct{}
+
+func (h *ftpHandler) GetProtocolName() string {
+	return "FTP"
+}
+
+func (h *ftpHandler) HandleProtocolNegotiation(clientConn, backendConn net.Conn) (net.Conn, net.Conn, error) {
+	return clientConn, backendConn, nil
 }
 
 func (p *FTPProxy) Serve(listener net.Listener) error {
-	for {
-		clientConn, err := listener.Accept()
-		if err != nil {
-			return fmt.Errorf("failed to accept connection: %w", err)
-		}
-		go p.handleConnection(clientConn)
-	}
+	return p.BaseProxy.Serve(listener)
 }
-
 func (p *FTPProxy) handleConnection(clientConn net.Conn) {
 	defer clientConn.Close()
 
-	backendConn, err := net.DialTimeout("tcp", p.Backend, 10*time.Second)
+	backendConn, err := p.connectToBackend()
 	if err != nil {
 		log.Printf("Failed to connect to FTP backend %s: %v", p.Backend, err)
 		return
