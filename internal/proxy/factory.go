@@ -147,12 +147,25 @@ type ProxyManager struct {
 	mu      sync.RWMutex
 }
 
+// Global proxy manager instance
+var globalManager *ProxyManager
+
 // NewManager creates a new proxy manager
 func NewManager(factory *Factory) *ProxyManager {
 	return &ProxyManager{
 		factory: factory,
 		proxies: make(map[string]Proxy),
 	}
+}
+
+// GetGlobalManager returns the global proxy manager instance
+func GetGlobalManager() *ProxyManager {
+	return globalManager
+}
+
+// SetGlobalManager sets the global proxy manager instance
+func SetGlobalManager(manager *ProxyManager) {
+	globalManager = manager
 }
 
 // StartProxy starts a new proxy instance

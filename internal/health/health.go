@@ -15,6 +15,19 @@ import (
 	"time"
 )
 
+// Global health server instance
+var globalServer *http.Server
+
+// GetGlobalServer returns the global health server instance
+func GetGlobalServer() *http.Server {
+	return globalServer
+}
+
+// SetGlobalServer sets the global health server instance
+func SetGlobalServer(server *http.Server) {
+	globalServer = server
+}
+
 type Status string
 
 const (

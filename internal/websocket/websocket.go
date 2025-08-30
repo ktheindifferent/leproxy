@@ -18,6 +18,24 @@ import (
 	"github.com/artyom/leproxy/internal/ratelimit"
 )
 
+// Global WebSocket proxy instance
+var globalProxy *Proxy
+
+// Proxy interface for WebSocket proxy operations
+type Proxy interface {
+	Close() error
+}
+
+// GetGlobalProxy returns the global WebSocket proxy instance
+func GetGlobalProxy() *Proxy {
+	return globalProxy
+}
+
+// SetGlobalProxy sets the global WebSocket proxy instance
+func SetGlobalProxy(proxy *Proxy) {
+	globalProxy = proxy
+}
+
 type WSProxy struct {
 	target      *url.URL
 	tlsConfig   *tls.Config
@@ -424,6 +442,29 @@ func (wp *WSProxy) Stats() Stats {
 		ActiveConnections: wp.stats.activeConnections,
 		TotalConnections:  wp.stats.totalConnections,
 		BytesTransferred:  wp.stats.bytesTransferred,
+	}
+}
+
+// Close gracefully closes the WebSocket proxy
+func (wp *WSProxy) Close() error {
+	// Wait for active connections to complete (with timeout)
+	timeout := time.After(10 * time.Second)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-timeout:
+			activeConns := atomic.LoadInt64(&wp.stats.activeConnections)
+			if activeConns > 0 {
+				return fmt.Errorf("timeout waiting for %d active connections to close", activeConns)
+			}
+			return nil
+		case <-ticker.C:
+			if atomic.LoadInt64(&wp.stats.activeConnections) == 0 {
+				return nil
+			}
+		}
 	}
 }
 

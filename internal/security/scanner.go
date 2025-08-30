@@ -17,6 +17,19 @@ import (
 	"time"
 )
 
+// Global scanner instance
+var globalScanner *Scanner
+
+// GetGlobalScanner returns the global security scanner instance
+func GetGlobalScanner() *Scanner {
+	return globalScanner
+}
+
+// SetGlobalScanner sets the global security scanner instance
+func SetGlobalScanner(scanner *Scanner) {
+	globalScanner = scanner
+}
+
 // VulnerabilityLevel represents the severity of a vulnerability
 type VulnerabilityLevel string
 
@@ -659,4 +672,15 @@ func (s *Scanner) generateMarkdownReport(result *ScanResult) ([]byte, error) {
 	}
 	
 	return []byte(sb.String()), nil
+}
+
+// Stop gracefully stops the security scanner
+func (s *Scanner) Stop() {
+	// Clean up any resources
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	
+	// Clear scan history to free memory
+	s.scanHistory = nil
+	s.lastScan = nil
 }
