@@ -8,37 +8,36 @@ import (
 	"log"
 	"net"
 	"strings"
-	"time"
 )
 
 type SMTPProxy struct {
-	Backend   string
-	TLSConfig *tls.Config
-	EnableTLS bool
+	*BaseProxy
 }
 
 func NewSMTPProxy(backend string, tlsConfig *tls.Config) *SMTPProxy {
 	return &SMTPProxy{
-		Backend:   backend,
-		TLSConfig: tlsConfig,
-		EnableTLS: tlsConfig != nil,
+		BaseProxy: NewBaseProxy(backend, tlsConfig, &smtpHandler{}),
 	}
+}
+
+// smtpHandler implements ProxyHandler for SMTP
+type smtpHandler struct{}
+
+func (h *smtpHandler) GetProtocolName() string {
+	return "SMTP"
+}
+
+func (h *smtpHandler) HandleProtocolNegotiation(clientConn, backendConn net.Conn) (net.Conn, net.Conn, error) {
+	return clientConn, backendConn, nil
 }
 
 func (p *SMTPProxy) Serve(listener net.Listener) error {
-	for {
-		clientConn, err := listener.Accept()
-		if err != nil {
-			return fmt.Errorf("failed to accept connection: %w", err)
-		}
-		go p.handleConnection(clientConn)
-	}
+	return p.BaseProxy.Serve(listener)
 }
-
 func (p *SMTPProxy) handleConnection(clientConn net.Conn) {
 	defer clientConn.Close()
 
-	backendConn, err := net.DialTimeout("tcp", p.Backend, 10*time.Second)
+	backendConn, err := p.connectToBackend()
 	if err != nil {
 		log.Printf("Failed to connect to SMTP backend %s: %v", p.Backend, err)
 		return

@@ -1,18 +1,28 @@
 package dbproxy
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
+	
+	"github.com/artyom/leproxy/internal/config"
+	"github.com/artyom/leproxy/internal/metrics"
 )
 
 const (
-	DefaultConnectTimeout = 10 * time.Second
-	TLSHandshakeByte     = 0x16
+	DefaultConnectTimeout    = 10 * time.Second
+	DefaultReadTimeout       = 30 * time.Second
+	DefaultWriteTimeout      = 30 * time.Second
+	DefaultIdleTimeout       = 5 * time.Minute
+	DefaultKeepaliveInterval = 30 * time.Second
+	DefaultBufferSize        = 32 * 1024 // 32KB
+	TLSHandshakeByte         = 0x16
 )
 
 type ProxyHandler interface {
@@ -21,18 +31,61 @@ type ProxyHandler interface {
 }
 
 type BaseProxy struct {
-	Backend   string
-	TLSConfig *tls.Config
-	EnableTLS bool
-	Handler   ProxyHandler
+	Backend        string
+	TLSConfig      *tls.Config
+	EnableTLS      bool
+	Handler        ProxyHandler
+	TimeoutConfig  *config.ProxyTimeoutConfig
+	timeoutMetrics *TimeoutMetrics
+}
+
+// TimeoutMetrics tracks timeout-related metrics
+type TimeoutMetrics struct {
+	ReadTimeouts  atomic.Uint64
+	WriteTimeouts atomic.Uint64
+	IdleTimeouts  atomic.Uint64
+	TotalBytes    atomic.Uint64
+	Retries       atomic.Uint64
 }
 
 func NewBaseProxy(backend string, tlsConfig *tls.Config, handler ProxyHandler) *BaseProxy {
 	return &BaseProxy{
-		Backend:   backend,
-		TLSConfig: tlsConfig,
-		EnableTLS: tlsConfig != nil,
-		Handler:   handler,
+		Backend:        backend,
+		TLSConfig:      tlsConfig,
+		EnableTLS:      tlsConfig != nil,
+		Handler:        handler,
+		TimeoutConfig:  defaultTimeoutConfig(),
+		timeoutMetrics: &TimeoutMetrics{},
+	}
+}
+
+// NewBaseProxyWithTimeout creates a new BaseProxy with custom timeout configuration
+func NewBaseProxyWithTimeout(backend string, tlsConfig *tls.Config, handler ProxyHandler, timeoutConfig *config.ProxyTimeoutConfig) *BaseProxy {
+	if timeoutConfig == nil {
+		timeoutConfig = defaultTimeoutConfig()
+	}
+	return &BaseProxy{
+		Backend:        backend,
+		TLSConfig:      tlsConfig,
+		EnableTLS:      tlsConfig != nil,
+		Handler:        handler,
+		TimeoutConfig:  timeoutConfig,
+		timeoutMetrics: &TimeoutMetrics{},
+	}
+}
+
+func defaultTimeoutConfig() *config.ProxyTimeoutConfig {
+	return &config.ProxyTimeoutConfig{
+		ConnectTimeout:           config.Duration(DefaultConnectTimeout),
+		ReadTimeout:              config.Duration(DefaultReadTimeout),
+		WriteTimeout:             config.Duration(DefaultWriteTimeout),
+		IdleTimeout:              config.Duration(DefaultIdleTimeout),
+		KeepaliveInterval:        config.Duration(DefaultKeepaliveInterval),
+		EnableKeepalive:          true,
+		BufferSize:               DefaultBufferSize,
+		EnableExponentialBackoff: true,
+		MaxRetries:               3,
+		RetryDelay:               config.Duration(time.Second),
 	}
 }
 
@@ -68,26 +121,217 @@ func (p *BaseProxy) handleConnection(clientConn net.Conn) {
 }
 
 func (p *BaseProxy) connectToBackend() (net.Conn, error) {
-	return net.DialTimeout("tcp", p.Backend, DefaultConnectTimeout)
+	timeout := time.Duration(p.TimeoutConfig.ConnectTimeout)
+	if timeout == 0 {
+		timeout = DefaultConnectTimeout
+	}
+	
+	conn, err := net.DialTimeout("tcp", p.Backend, timeout)
+	if err != nil {
+		return nil, err
+	}
+	
+	// Configure TCP keepalive if enabled
+	if p.TimeoutConfig.EnableKeepalive {
+		if tcpConn, ok := conn.(*net.TCPConn); ok {
+			tcpConn.SetKeepAlive(true)
+			tcpConn.SetKeepAlivePeriod(time.Duration(p.TimeoutConfig.KeepaliveInterval))
+		}
+	}
+	
+	return conn, nil
 }
 
 func (p *BaseProxy) proxyConnections(clientConn, backendConn net.Conn) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	
 	var wg sync.WaitGroup
 	wg.Add(2)
-
-	copyData := func(dst, src net.Conn, direction string) {
+	
+	// Create channels to signal completion
+	done := make(chan struct{}, 2)
+	
+	// Copy data with timeout handling
+	copyWithTimeout := func(dst, src net.Conn, direction string) {
 		defer wg.Done()
-		_, err := io.Copy(dst, src)
-		if err != nil && err != io.EOF {
-			log.Printf("%s proxy %s error: %v", 
+		defer func() { done <- struct{}{} }()
+		
+		err := p.copyDataWithTimeout(ctx, dst, src, direction)
+		if err != nil && err != io.EOF && err != context.Canceled {
+			log.Printf("%s proxy %s error: %v",
 				p.Handler.GetProtocolName(), direction, err)
 		}
+		
+		// Signal the other goroutine to stop
+		cancel()
 	}
-
-	go copyData(backendConn, clientConn, "client->backend")
-	go copyData(clientConn, backendConn, "backend->client")
-
+	
+	go copyWithTimeout(backendConn, clientConn, "client->backend")
+	go copyWithTimeout(clientConn, backendConn, "backend->client")
+	
+	// Wait for both goroutines to complete
 	wg.Wait()
+}
+
+// copyDataWithTimeout performs data copying with timeout and retry logic
+func (p *BaseProxy) copyDataWithTimeout(ctx context.Context, dst, src net.Conn, direction string) error {
+	bufferSize := p.TimeoutConfig.BufferSize
+	if bufferSize <= 0 {
+		bufferSize = DefaultBufferSize
+	}
+	
+	buffer := make([]byte, bufferSize)
+	idleTimeout := time.Duration(p.TimeoutConfig.IdleTimeout)
+	readTimeout := time.Duration(p.TimeoutConfig.ReadTimeout)
+	writeTimeout := time.Duration(p.TimeoutConfig.WriteTimeout)
+	
+	var (
+		totalBytes   int64
+		retryCount   int
+		retryDelay   = time.Duration(p.TimeoutConfig.RetryDelay)
+		lastActivity = time.Now()
+	)
+	
+	for {
+		// Check if context is cancelled
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		
+		// Set read deadline
+		if readTimeout > 0 {
+			src.SetReadDeadline(time.Now().Add(readTimeout))
+		}
+		
+		// Read from source
+		n, readErr := src.Read(buffer)
+		
+		if n > 0 {
+			// Set write deadline
+			if writeTimeout > 0 {
+				dst.SetWriteDeadline(time.Now().Add(writeTimeout))
+			}
+			
+			// Write to destination
+			written := 0
+			for written < n {
+				w, writeErr := dst.Write(buffer[written:n])
+				if writeErr != nil {
+					if p.shouldRetry(writeErr, retryCount) {
+						p.timeoutMetrics.Retries.Add(1)
+						retryCount++
+						time.Sleep(p.calculateBackoff(retryCount, retryDelay))
+						continue
+					}
+					
+					// Track timeout metrics
+					if isTimeout(writeErr) {
+						p.timeoutMetrics.WriteTimeouts.Add(1)
+						metrics.RecordTimeout(p.Handler.GetProtocolName(), "write", direction)
+					}
+					return writeErr
+				}
+				written += w
+			}
+			
+			totalBytes += int64(n)
+			p.timeoutMetrics.TotalBytes.Add(uint64(n))
+			lastActivity = time.Now()
+			retryCount = 0 // Reset retry count on successful operation
+		}
+		
+		// Check for idle timeout
+		if idleTimeout > 0 && time.Since(lastActivity) > idleTimeout {
+			p.timeoutMetrics.IdleTimeouts.Add(1)
+			metrics.RecordTimeout(p.Handler.GetProtocolName(), "idle", direction)
+			return fmt.Errorf("connection idle timeout exceeded")
+		}
+		
+		if readErr != nil {
+			if readErr == io.EOF {
+				return nil // Normal termination
+			}
+			
+			if p.shouldRetry(readErr, retryCount) {
+				p.timeoutMetrics.Retries.Add(1)
+				retryCount++
+				time.Sleep(p.calculateBackoff(retryCount, retryDelay))
+				continue
+			}
+			
+			// Track timeout metrics
+			if isTimeout(readErr) {
+				p.timeoutMetrics.ReadTimeouts.Add(1)
+				metrics.RecordTimeout(p.Handler.GetProtocolName(), "read", direction)
+			}
+			
+			return readErr
+		}
+	}
+}
+
+// shouldRetry determines if an error is retryable
+func (p *BaseProxy) shouldRetry(err error, retryCount int) bool {
+	if !p.TimeoutConfig.EnableExponentialBackoff {
+		return false
+	}
+	
+	if retryCount >= p.TimeoutConfig.MaxRetries {
+		return false
+	}
+	
+	// Check if it's a temporary network error
+	if netErr, ok := err.(net.Error); ok {
+		return netErr.Temporary()
+	}
+	
+	return false
+}
+
+// calculateBackoff calculates the backoff delay with exponential increase
+func (p *BaseProxy) calculateBackoff(retryCount int, baseDelay time.Duration) time.Duration {
+	if !p.TimeoutConfig.EnableExponentialBackoff {
+		return baseDelay
+	}
+	
+	// Exponential backoff: delay * 2^(retryCount-1)
+	delay := baseDelay
+	for i := 1; i < retryCount; i++ {
+		delay *= 2
+		if delay > 30*time.Second {
+			delay = 30 * time.Second // Cap at 30 seconds
+			break
+		}
+	}
+	
+	return delay
+}
+
+// isTimeout checks if an error is a timeout error
+func isTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	
+	if netErr, ok := err.(net.Error); ok {
+		return netErr.Timeout()
+	}
+	
+	return false
+}
+
+// GetTimeoutMetrics returns current timeout metrics
+func (p *BaseProxy) GetTimeoutMetrics() map[string]uint64 {
+	return map[string]uint64{
+		"read_timeouts":  p.timeoutMetrics.ReadTimeouts.Load(),
+		"write_timeouts": p.timeoutMetrics.WriteTimeouts.Load(),
+		"idle_timeouts":  p.timeoutMetrics.IdleTimeouts.Load(),
+		"total_bytes":    p.timeoutMetrics.TotalBytes.Load(),
+		"retries":        p.timeoutMetrics.Retries.Load(),
+	}
 }
 
 func (p *BaseProxy) UpgradeToTLS(conn net.Conn) (*tls.Conn, error) {

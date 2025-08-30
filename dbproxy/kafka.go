@@ -7,46 +7,42 @@ import (
 	"io"
 	"log"
 	"net"
-	"time"
 )
 
 // KafkaProxy handles Apache Kafka protocol proxying with TLS encryption support
 // Supports both plaintext and TLS-encrypted Kafka connections
 type KafkaProxy struct {
-	Backend   string      // Backend Kafka broker address (host:port)
-	TLSConfig *tls.Config // TLS configuration for client-side connections
-	EnableTLS bool        // Whether TLS encryption is enabled
+	*BaseProxy
 }
 
 // NewKafkaProxy creates a new Kafka proxy instance for handling Kafka broker connections
 func NewKafkaProxy(backend string, tlsConfig *tls.Config) *KafkaProxy {
 	return &KafkaProxy{
-		Backend:   backend,
-		TLSConfig: tlsConfig,
-		EnableTLS: tlsConfig != nil,
+		BaseProxy: NewBaseProxy(backend, tlsConfig, &kafkaHandler{}),
 	}
+}
+
+// kafkaHandler implements ProxyHandler for Kafka
+type kafkaHandler struct{}
+
+func (h *kafkaHandler) GetProtocolName() string {
+	return "Kafka"
+}
+
+func (h *kafkaHandler) HandleProtocolNegotiation(clientConn, backendConn net.Conn) (net.Conn, net.Conn, error) {
+	return clientConn, backendConn, nil
 }
 
 // Serve starts accepting and handling Kafka client connections
 // Runs in an infinite loop accepting connections until an error occurs
 func (p *KafkaProxy) Serve(listener net.Listener) error {
-	for {
-		clientConn, err := listener.Accept()
-		if err != nil {
-			return fmt.Errorf("failed to accept connection: %w", err)
-		}
-		// Handle each Kafka client in a separate goroutine for concurrency
-		go p.handleConnection(clientConn)
-	}
+	return p.BaseProxy.Serve(listener)
 }
-
-// handleConnection manages a single Kafka client connection
-// Establishes TLS if configured and proxies data between client and backend
 func (p *KafkaProxy) handleConnection(clientConn net.Conn) {
 	defer clientConn.Close()
 
 	// Connect to the backend Kafka broker
-	backendConn, err := net.DialTimeout("tcp", p.Backend, 10*time.Second)
+	backendConn, err := p.connectToBackend()
 	if err != nil {
 		log.Printf("Failed to connect to Kafka backend %s: %v", p.Backend, err)
 		return
