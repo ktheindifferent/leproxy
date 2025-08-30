@@ -92,6 +92,9 @@ type DatabaseProxyConfig struct {
 	
 	// Connection pooling
 	Pool PoolConfig `yaml:"pool" json:"pool"`
+	
+	// Timeout configuration
+	Timeouts ProxyTimeoutConfig `yaml:"timeouts" json:"timeouts"`
 }
 
 type PoolConfig struct {
@@ -100,6 +103,39 @@ type PoolConfig struct {
 	MaxConns    int      `yaml:"max_conns" json:"max_conns" default:"10"`
 	MaxLifetime Duration `yaml:"max_lifetime" json:"max_lifetime" default:"30m"`
 	IdleTimeout Duration `yaml:"idle_timeout" json:"idle_timeout" default:"5m"`
+}
+
+// ProxyTimeoutConfig defines timeout settings for proxy operations
+type ProxyTimeoutConfig struct {
+	// ConnectTimeout is the maximum time to establish a connection
+	ConnectTimeout Duration `yaml:"connect_timeout" json:"connect_timeout" default:"10s"`
+	
+	// ReadTimeout is the maximum time for a single read operation
+	ReadTimeout Duration `yaml:"read_timeout" json:"read_timeout" default:"30s"`
+	
+	// WriteTimeout is the maximum time for a single write operation
+	WriteTimeout Duration `yaml:"write_timeout" json:"write_timeout" default:"30s"`
+	
+	// IdleTimeout is the maximum time a connection can be idle before timing out
+	IdleTimeout Duration `yaml:"idle_timeout" json:"idle_timeout" default:"5m"`
+	
+	// KeepaliveInterval is the interval for sending keepalive packets
+	KeepaliveInterval Duration `yaml:"keepalive_interval" json:"keepalive_interval" default:"30s"`
+	
+	// EnableKeepalive enables TCP keepalive for long-lived connections
+	EnableKeepalive bool `yaml:"enable_keepalive" json:"enable_keepalive" default:"true"`
+	
+	// BufferSize is the size of the copy buffer in bytes
+	BufferSize int `yaml:"buffer_size" json:"buffer_size" default:"32768"`
+	
+	// EnableExponentialBackoff enables exponential backoff for transient failures
+	EnableExponentialBackoff bool `yaml:"enable_exponential_backoff" json:"enable_exponential_backoff" default:"true"`
+	
+	// MaxRetries is the maximum number of retries for transient failures
+	MaxRetries int `yaml:"max_retries" json:"max_retries" default:"3"`
+	
+	// RetryDelay is the initial delay between retries
+	RetryDelay Duration `yaml:"retry_delay" json:"retry_delay" default:"1s"`
 }
 
 type SecurityConfig struct {

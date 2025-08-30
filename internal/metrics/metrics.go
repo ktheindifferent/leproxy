@@ -218,6 +218,15 @@ var (
 		"Total number of HTTP requests",
 	)
 	
+	// Declare enhanced certificate renewal metrics
+	CertificateRenewalLatency    *Metric
+	CertificateRenewalRetries     *Metric
+	CertificateRenewalQueueSize   *Metric
+	CertificateEmergencyRenewals  *Metric
+	ACMEProviderErrors           *Metric
+	ACMEProviderLatency          *Metric
+	RenewalManagerHealth         *Metric
+	
 	HTTPRequestDuration = defaultRegistry.Register(
 		"http_request_duration_seconds",
 		MetricTypeHistogram,
@@ -265,7 +274,65 @@ var (
 		MetricTypeCounter,
 		"Total number of errors by type",
 	)
+	
+	ProxyTimeoutsTotal = defaultRegistry.Register(
+		"proxy_timeouts_total",
+		MetricTypeCounter,
+		"Total number of proxy timeouts by type",
+	)
+	
+	ProxyRetriesTotal = defaultRegistry.Register(
+		"proxy_retries_total",
+		MetricTypeCounter,
+		"Total number of proxy operation retries",
+	)
 )
+
+// init initializes the enhanced certificate renewal metrics
+func init() {
+	// Initialize enhanced certificate renewal metrics
+	CertificateRenewalLatency = defaultRegistry.Register(
+		"certificate_renewal_latency_seconds",
+		MetricTypeHistogram,
+		"Certificate renewal latency in seconds",
+	)
+	
+	CertificateRenewalRetries = defaultRegistry.Register(
+		"certificate_renewal_retries_total",
+		MetricTypeCounter,
+		"Total number of certificate renewal retries",
+	)
+	
+	CertificateRenewalQueueSize = defaultRegistry.Register(
+		"certificate_renewal_queue_size",
+		MetricTypeGauge,
+		"Number of certificates pending renewal",
+	)
+	
+	CertificateEmergencyRenewals = defaultRegistry.Register(
+		"certificate_emergency_renewals_total",
+		MetricTypeCounter,
+		"Total number of emergency certificate renewals",
+	)
+	
+	ACMEProviderErrors = defaultRegistry.Register(
+		"acme_provider_errors_total",
+		MetricTypeCounter,
+		"Total number of ACME provider errors",
+	)
+	
+	ACMEProviderLatency = defaultRegistry.Register(
+		"acme_provider_latency_seconds",
+		MetricTypeHistogram,
+		"ACME provider response latency",
+	)
+	
+	RenewalManagerHealth = defaultRegistry.Register(
+		"renewal_manager_health",
+		MetricTypeGauge,
+		"Renewal manager health status (1=healthy, 0=unhealthy)",
+	)
+}
 
 // Middleware for HTTP metrics
 func HTTPMetricsMiddleware(next http.Handler) http.Handler {
@@ -339,6 +406,123 @@ func RecordCertificateRenewal(domain string, success bool) {
 	CertificateRenewalsTotal.WithLabels(labels).Inc()
 }
 
+// Enhanced certificate renewal metrics functions
+
+func RecordRenewalLatency(domain string, provider string, duration float64) {
+	labels := map[string]string{
+		"domain":   domain,
+		"provider": provider,
+	}
+	CertificateRenewalLatency.WithLabels(labels).Observe(duration)
+}
+
+func RecordRenewalRetry(domain string, attempt int) {
+	labels := map[string]string{
+		"domain":  domain,
+		"attempt": strconv.Itoa(attempt),
+	}
+	CertificateRenewalRetries.WithLabels(labels).Inc()
+}
+
+func UpdateRenewalQueueSize(size float64) {
+	CertificateRenewalQueueSize.Set(size)
+}
+
+func RecordEmergencyRenewal(domain string) {
+	labels := map[string]string{"domain": domain}
+	CertificateEmergencyRenewals.WithLabels(labels).Inc()
+}
+
+func RecordACMEError(provider string, errorType string) {
+	labels := map[string]string{
+		"provider": provider,
+		"error":    errorType,
+	}
+	ACMEProviderErrors.WithLabels(labels).Inc()
+}
+
+func RecordACMELatency(provider string, operation string, duration float64) {
+	labels := map[string]string{
+		"provider":  provider,
+		"operation": operation,
+	}
+	ACMEProviderLatency.WithLabels(labels).Observe(duration)
+}
+
+func UpdateRenewalManagerHealth(healthy bool) {
+	if healthy {
+		RenewalManagerHealth.Set(1)
+	} else {
+		RenewalManagerHealth.Set(0)
+	}
+}
+
+// RenewalMetricsCollector provides a unified interface for renewal metrics
+type RenewalMetricsCollector struct {
+	mu sync.RWMutex
+	statuses map[string]RenewalMetricStatus
+}
+
+type RenewalMetricStatus struct {
+	Domain         string
+	LastAttempt    time.Time
+	LastSuccess    time.Time
+	FailureCount   int
+	IsRenewing     bool
+	ExpiryDate     time.Time
+}
+
+func NewRenewalMetricsCollector() *RenewalMetricsCollector {
+	return &RenewalMetricsCollector{
+		statuses: make(map[string]RenewalMetricStatus),
+	}
+}
+
+func (r *RenewalMetricsCollector) UpdateStatus(domain string, status RenewalMetricStatus) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.statuses[domain] = status
+	
+	// Update queue size metric
+	pendingCount := 0
+	for _, s := range r.statuses {
+		if s.IsRenewing {
+			pendingCount++
+		}
+	}
+	UpdateRenewalQueueSize(float64(pendingCount))
+}
+
+func (r *RenewalMetricsCollector) GetMetricsSummary() map[string]interface{} {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	
+	totalDomains := len(r.statuses)
+	renewingCount := 0
+	failedCount := 0
+	expiringCount := 0
+	
+	for _, status := range r.statuses {
+		if status.IsRenewing {
+			renewingCount++
+		}
+		if status.FailureCount > 0 {
+			failedCount++
+		}
+		if time.Until(status.ExpiryDate) < 7*24*time.Hour {
+			expiringCount++
+		}
+	}
+	
+	return map[string]interface{}{
+		"total_domains":   totalDomains,
+		"renewing_count":  renewingCount,
+		"failed_count":    failedCount,
+		"expiring_count":  expiringCount,
+		"statuses":        r.statuses,
+	}
+}
+
 func Register(name string, metricType MetricType, help string) *Metric {
 	return defaultRegistry.Register(name, metricType, help)
 }
@@ -349,4 +533,23 @@ func Get(name string) *Metric {
 
 func Handler() http.HandlerFunc {
 	return defaultRegistry.Handler()
+}
+
+// RecordTimeout records proxy timeout metrics
+func RecordTimeout(proxyType string, timeoutType string, direction string) {
+	labels := map[string]string{
+		"proxy_type":   proxyType,
+		"timeout_type": timeoutType,
+		"direction":    direction,
+	}
+	ProxyTimeoutsTotal.WithLabels(labels).Inc()
+}
+
+// RecordRetry records proxy retry metrics
+func RecordRetry(proxyType string, direction string) {
+	labels := map[string]string{
+		"proxy_type": proxyType,
+		"direction":  direction,
+	}
+	ProxyRetriesTotal.WithLabels(labels).Inc()
 }

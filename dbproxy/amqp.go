@@ -7,37 +7,36 @@ import (
 	"io"
 	"log"
 	"net"
-	"time"
 )
 
 type AMQPProxy struct {
-	Backend   string
-	TLSConfig *tls.Config
-	EnableTLS bool
+	*BaseProxy
 }
 
 func NewAMQPProxy(backend string, tlsConfig *tls.Config) *AMQPProxy {
 	return &AMQPProxy{
-		Backend:   backend,
-		TLSConfig: tlsConfig,
-		EnableTLS: tlsConfig != nil,
+		BaseProxy: NewBaseProxy(backend, tlsConfig, &amqpHandler{}),
 	}
+}
+
+// amqpHandler implements ProxyHandler for AMQP
+type amqpHandler struct{}
+
+func (h *amqpHandler) GetProtocolName() string {
+	return "AMQP"
+}
+
+func (h *amqpHandler) HandleProtocolNegotiation(clientConn, backendConn net.Conn) (net.Conn, net.Conn, error) {
+	return clientConn, backendConn, nil
 }
 
 func (p *AMQPProxy) Serve(listener net.Listener) error {
-	for {
-		clientConn, err := listener.Accept()
-		if err != nil {
-			return fmt.Errorf("failed to accept connection: %w", err)
-		}
-		go p.handleConnection(clientConn)
-	}
+	return p.BaseProxy.Serve(listener)
 }
-
 func (p *AMQPProxy) handleConnection(clientConn net.Conn) {
 	defer clientConn.Close()
 
-	backendConn, err := net.DialTimeout("tcp", p.Backend, 10*time.Second)
+	backendConn, err := p.connectToBackend()
 	if err != nil {
 		log.Printf("Failed to connect to AMQP backend %s: %v", p.Backend, err)
 		return

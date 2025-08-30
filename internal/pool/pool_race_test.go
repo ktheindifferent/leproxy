@@ -307,6 +307,134 @@ func TestPoolClosureRace(t *testing.T) {
 	}
 }
 
+// Test the specific race condition between Close() and connection return
+func TestPoolCloseConnectionReturnRace(t *testing.T) {
+	for i := 0; i < 100; i++ { // Run multiple times to catch race
+		var connID int32
+		
+		factory := func(ctx context.Context) (net.Conn, error) {
+			id := atomic.AddInt32(&connID, 1)
+			return NewMockConn(int(id)), nil
+		}
+		
+		cfg := Config{
+			Factory:     factory,
+			MinConns:    0,
+			MaxConns:    50,
+			MaxLifetime: 30 * time.Second,
+			IdleTimeout: 10 * time.Second,
+		}
+		
+		pool, err := New(cfg)
+		if err != nil {
+			t.Fatalf("Failed to create pool: %v", err)
+		}
+		
+		var wg sync.WaitGroup
+		conns := make([]net.Conn, 20)
+		
+		// Get multiple connections
+		for j := 0; j < len(conns); j++ {
+			conn, err := pool.Get(context.Background())
+			if err != nil {
+				t.Fatalf("Failed to get connection: %v", err)
+			}
+			conns[j] = conn
+		}
+		
+		// Start goroutines that will return connections
+		for j := 0; j < len(conns); j++ {
+			wg.Add(1)
+			go func(conn net.Conn) {
+				defer wg.Done()
+				// Small random delay
+				time.Sleep(time.Duration(time.Now().UnixNano()%100) * time.Nanosecond)
+				conn.Close() // Should not panic even if pool is closing
+			}(conns[j])
+		}
+		
+		// Concurrently close the pool
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Small delay to ensure some connections start returning
+			time.Sleep(time.Duration(time.Now().UnixNano()%50) * time.Nanosecond)
+			pool.Close()
+		}()
+		
+		wg.Wait()
+	}
+}
+
+// Test concurrent Close() calls
+func TestConcurrentPoolClose(t *testing.T) {
+	var connID int32
+	
+	factory := func(ctx context.Context) (net.Conn, error) {
+		id := atomic.AddInt32(&connID, 1)
+		return NewMockConn(int(id)), nil
+	}
+	
+	cfg := Config{
+		Factory:     factory,
+		MinConns:    5,
+		MaxConns:    20,
+		MaxLifetime: 30 * time.Second,
+		IdleTimeout: 10 * time.Second,
+	}
+	
+	pool, err := New(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create pool: %v", err)
+	}
+	
+	// Get some connections to make it interesting
+	conns := make([]net.Conn, 10)
+	for i := 0; i < len(conns); i++ {
+		conn, err := pool.Get(context.Background())
+		if err != nil {
+			t.Fatalf("Failed to get connection: %v", err)
+		}
+		conns[i] = conn
+	}
+	
+	var wg sync.WaitGroup
+	closeErrors := make([]error, 10)
+	
+	// Multiple goroutines trying to close the pool
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			closeErrors[idx] = pool.Close()
+		}(i)
+	}
+	
+	// Also return connections during close
+	for i := 0; i < len(conns); i++ {
+		wg.Add(1)
+		go func(conn net.Conn) {
+			defer wg.Done()
+			time.Sleep(time.Millisecond)
+			conn.Close()
+		}(conns[i])
+	}
+	
+	wg.Wait()
+	
+	// All Close() calls should succeed (idempotent)
+	for i, err := range closeErrors {
+		if err != nil {
+			t.Errorf("Close() call %d failed: %v", i, err)
+		}
+	}
+	
+	// Pool should be in closed state
+	if pool.GetState() != PoolStateClosed {
+		t.Errorf("Pool not in closed state after concurrent closes")
+	}
+}
+
 // Test graceful draining
 func TestPoolDraining(t *testing.T) {
 	var connID int32
@@ -497,6 +625,91 @@ func TestCleanupGoroutineNoLeak(t *testing.T) {
 	if leaked > 2 {
 		t.Errorf("Possible goroutine leak: initial=%d, final=%d, leaked=%d",
 			initialGoroutines, finalGoroutines, leaked)
+	}
+}
+
+// Test heavy concurrent stress with Close() during operations
+func TestPoolCloseUnderHeavyLoad(t *testing.T) {
+	var connID int32
+	
+	factory := func(ctx context.Context) (net.Conn, error) {
+		id := atomic.AddInt32(&connID, 1)
+		// Add some latency to make it more realistic
+		time.Sleep(100 * time.Microsecond)
+		return NewMockConn(int(id)), nil
+	}
+	
+	cfg := Config{
+		Factory:     factory,
+		MinConns:    0,
+		MaxConns:    100,
+		MaxLifetime: 5 * time.Second,
+		IdleTimeout: 2 * time.Second,
+	}
+	
+	pool, err := New(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create pool: %v", err)
+	}
+	
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	panics := make(chan interface{}, 1000)
+	
+	// Start many workers doing Get/Put operations
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					panics <- r
+				}
+			}()
+			
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+					conn, err := pool.Get(ctx)
+					cancel()
+					
+					if err != nil {
+						if err == ErrPoolClosed || err == ErrPoolDraining {
+							return // Expected when closing
+						}
+						continue
+					}
+					
+					// Simulate some work
+					time.Sleep(time.Duration(time.Now().UnixNano()%1000) * time.Nanosecond)
+					
+					// Return connection - should never panic
+					conn.Close()
+				}
+			}
+		}()
+	}
+	
+	// Let workers run for a bit
+	time.Sleep(100 * time.Millisecond)
+	
+	// Close the pool while workers are active
+	err = pool.Close()
+	if err != nil {
+		t.Errorf("Failed to close pool: %v", err)
+	}
+	
+	// Signal workers to stop
+	close(stop)
+	wg.Wait()
+	close(panics)
+	
+	// Check for panics
+	for p := range panics {
+		t.Errorf("Panic detected: %v", p)
 	}
 }
 

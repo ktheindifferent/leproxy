@@ -7,37 +7,36 @@ import (
 	"io"
 	"log"
 	"net"
-	"time"
 )
 
 type CassandraProxy struct {
-	Backend   string
-	TLSConfig *tls.Config
-	EnableTLS bool
+	*BaseProxy
 }
 
 func NewCassandraProxy(backend string, tlsConfig *tls.Config) *CassandraProxy {
 	return &CassandraProxy{
-		Backend:   backend,
-		TLSConfig: tlsConfig,
-		EnableTLS: tlsConfig != nil,
+		BaseProxy: NewBaseProxy(backend, tlsConfig, &cassandraHandler{}),
 	}
+}
+
+// cassandraHandler implements ProxyHandler for Cassandra
+type cassandraHandler struct{}
+
+func (h *cassandraHandler) GetProtocolName() string {
+	return "Cassandra"
+}
+
+func (h *cassandraHandler) HandleProtocolNegotiation(clientConn, backendConn net.Conn) (net.Conn, net.Conn, error) {
+	return clientConn, backendConn, nil
 }
 
 func (p *CassandraProxy) Serve(listener net.Listener) error {
-	for {
-		clientConn, err := listener.Accept()
-		if err != nil {
-			return fmt.Errorf("failed to accept connection: %w", err)
-		}
-		go p.handleConnection(clientConn)
-	}
+	return p.BaseProxy.Serve(listener)
 }
-
 func (p *CassandraProxy) handleConnection(clientConn net.Conn) {
 	defer clientConn.Close()
 
-	backendConn, err := net.DialTimeout("tcp", p.Backend, 10*time.Second)
+	backendConn, err := p.connectToBackend()
 	if err != nil {
 		log.Printf("Failed to connect to Cassandra backend %s: %v", p.Backend, err)
 		return

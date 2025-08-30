@@ -2,7 +2,6 @@ package acme
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -97,7 +96,7 @@ func (am *AlertManager) SendAlert(status *RenewalStatus) {
 		go func() {
 			defer wg.Done()
 			if err := am.sendEmailAlert(message, severity); err != nil {
-				logger.Error("Failed to send email alert", "error", err)
+				logger.Error("Failed to send email alert", map[string]interface{}{"error": err})
 			}
 		}()
 	}
@@ -107,7 +106,7 @@ func (am *AlertManager) SendAlert(status *RenewalStatus) {
 		go func() {
 			defer wg.Done()
 			if err := am.sendWebhookAlert(status, severity); err != nil {
-				logger.Error("Failed to send webhook alert", "error", err)
+				logger.Error("Failed to send webhook alert", map[string]interface{}{"error": err})
 			}
 		}()
 	}
@@ -117,7 +116,7 @@ func (am *AlertManager) SendAlert(status *RenewalStatus) {
 		go func() {
 			defer wg.Done()
 			if err := am.sendSlackAlert(status, severity); err != nil {
-				logger.Error("Failed to send Slack alert", "error", err)
+				logger.Error("Failed to send Slack alert", map[string]interface{}{"error": err})
 			}
 		}()
 	}
@@ -229,7 +228,7 @@ func (am *AlertManager) sendEmailAlert(message, severity string) error {
 		return fmt.Errorf("failed to send email: %w", err)
 	}
 	
-	logger.Info("Email alert sent", "severity", severity, "recipients", len(am.config.EmailTo))
+	logger.Info("Email alert sent", map[string]interface{}{"severity": severity, "recipients": len(am.config.EmailTo)})
 	return nil
 }
 
@@ -286,7 +285,7 @@ func (am *AlertManager) sendWebhookAlert(status *RenewalStatus, severity string)
 		return fmt.Errorf("webhook returned error status: %d", resp.StatusCode)
 	}
 	
-	logger.Info("Webhook alert sent", "severity", severity, "url", am.config.WebhookURL)
+	logger.Info("Webhook alert sent", map[string]interface{}{"severity": severity, "url": am.config.WebhookURL})
 	return nil
 }
 
@@ -374,7 +373,7 @@ func (am *AlertManager) sendSlackAlert(status *RenewalStatus, severity string) e
 		return fmt.Errorf("Slack webhook returned error status: %d", resp.StatusCode)
 	}
 	
-	logger.Info("Slack alert sent", "severity", severity, "channel", am.config.SlackChannel)
+	logger.Info("Slack alert sent", map[string]interface{}{"severity": severity, "channel": am.config.SlackChannel})
 	return nil
 }
 

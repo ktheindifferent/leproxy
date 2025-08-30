@@ -2,138 +2,97 @@ package dbproxy
 
 import (
 	"bytes"
-	"context"
 	"crypto/tls"
 	"encoding/binary"
-	"fmt"
+	"log"
 	"net"
-	"sync"
-	"sync/atomic"
-	"time"
 )
 
-// MySQLProxy handles MySQL protocol proxying with optional TLS support
 type MySQLProxy struct {
 	*BaseProxy
 }
 
-// NewMySQLProxy creates a new MySQL proxy instance
 func NewMySQLProxy(backend string, tlsConfig *tls.Config) *MySQLProxy {
-	handler := &mysqlHandler{}
-	base := NewBaseProxy(backend, tlsConfig, handler)
-	proxy := &MySQLProxy{
-		BaseProxy: base,
+	return &MySQLProxy{
+		BaseProxy: NewBaseProxy(backend, tlsConfig, &mysqlHandler{}),
 	}
-	handler.proxy = proxy
-	return proxy
 }
 
 // mysqlHandler implements ProxyHandler for MySQL
-type mysqlHandler struct {
-	proxy *MySQLProxy
-}
+type mysqlHandler struct{}
 
 func (h *mysqlHandler) GetProtocolName() string {
 	return "MySQL"
 }
 
-func (h *mysqlHandler) HandleProtocolNegotiation(ctx context.Context, clientConn, backendConn net.Conn) (net.Conn, net.Conn, error) {
-	// Create a channel to signal completion
-	done := make(chan struct{})
-	defer close(done)
-	
-	// Monitor context cancellation
-	go func() {
-		select {
-		case <-ctx.Done():
-			clientConn.Close()
-			backendConn.Close()
-		case <-done:
-		}
-	}()
-	
-	// Set read timeout for handshake
-	if err := backendConn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
-		return clientConn, backendConn, fmt.Errorf("failed to set read deadline: %w", err)
+func (h *mysqlHandler) HandleProtocolNegotiation(clientConn, backendConn net.Conn) (net.Conn, net.Conn, error) {
+	// MySQL handles its own SSL negotiation during the connection handshake
+	return clientConn, backendConn, nil
+}
+
+func (p *MySQLProxy) Serve(listener net.Listener) error {
+	return p.BaseProxy.Serve(listener)
+}
+
+func (p *MySQLProxy) handleConnection(clientConn net.Conn) {
+	defer clientConn.Close()
+
+	backendConn, err := p.connectToBackend()
+	if err != nil {
+		log.Printf("Failed to connect to MySQL backend %s: %v", p.Backend, err)
+		return
 	}
-	
+	defer backendConn.Close()
+
 	// MySQL initial handshake from server
 	handshakeBuf := make([]byte, 4096)
 	n, err := backendConn.Read(handshakeBuf)
 	if err != nil {
-		return clientConn, backendConn, fmt.Errorf("failed to read MySQL handshake: %w", err)
+		log.Printf("Failed to read MySQL handshake: %v", err)
+		return
 	}
-	
-	// Reset deadline after read
-	if err := backendConn.SetReadDeadline(time.Time{}); err != nil {
-		return clientConn, backendConn, fmt.Errorf("failed to reset read deadline: %w", err)
-	}
-	
+
 	// Check if server supports SSL (capability flag 0x0800)
-	if h.proxy.EnableTLS && h.proxy.supportsSSL(handshakeBuf[:n]) {
+	if p.EnableTLS && p.supportsSSL(handshakeBuf[:n]) {
 		// Send modified handshake to client with SSL capability
-		if err := h.proxy.writeWithTimeout(clientConn, handshakeBuf[:n], 10*time.Second); err != nil {
-			return clientConn, backendConn, fmt.Errorf("failed to send handshake to client: %w", err)
+		if _, err := clientConn.Write(handshakeBuf[:n]); err != nil {
+			log.Printf("Failed to send handshake to client: %v", err)
+			return
 		}
-		
+
 		// Wait for SSL request packet from client
 		sslReqBuf := make([]byte, 36)
-		if err := h.proxy.readWithTimeout(clientConn, sslReqBuf, 10*time.Second); err != nil {
-			return clientConn, backendConn, fmt.Errorf("failed to read SSL request: %w", err)
+		if _, err := clientConn.Read(sslReqBuf); err != nil {
+			log.Printf("Failed to read SSL request: %v", err)
+			return
 		}
-		
+
 		// Check if client requested SSL
-		if h.proxy.isSSLRequest(sslReqBuf) {
+		if p.isSSLRequest(sslReqBuf) {
 			// Upgrade client connection to TLS
-			tlsConn := tls.Server(clientConn, h.proxy.TLSConfig)
-			// Set handshake timeout
-			if err := tlsConn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
-				return clientConn, backendConn, fmt.Errorf("failed to set TLS deadline: %w", err)
-			}
+			tlsConn := tls.Server(clientConn, p.TLSConfig)
 			if err := tlsConn.Handshake(); err != nil {
-				return clientConn, backendConn, fmt.Errorf("TLS handshake failed: %w", err)
-			}
-			// Reset deadline after handshake
-			if err := tlsConn.SetDeadline(time.Time{}); err != nil {
-				return clientConn, backendConn, fmt.Errorf("failed to reset TLS deadline: %w", err)
+				log.Printf("TLS handshake failed: %v", err)
+				return
 			}
 			clientConn = tlsConn
-			
+
 			// Forward SSL request to backend
-			if err := h.proxy.writeWithTimeout(backendConn, sslReqBuf, 10*time.Second); err != nil {
-				return clientConn, backendConn, fmt.Errorf("failed to forward SSL request: %w", err)
+			if _, err := backendConn.Write(sslReqBuf); err != nil {
+				log.Printf("Failed to forward SSL request: %v", err)
+				return
 			}
 		}
 	} else {
 		// No TLS, just forward the handshake
-		if err := h.proxy.writeWithTimeout(clientConn, handshakeBuf[:n], 10*time.Second); err != nil {
-			return clientConn, backendConn, fmt.Errorf("failed to send handshake to client: %w", err)
+		if _, err := clientConn.Write(handshakeBuf[:n]); err != nil {
+			log.Printf("Failed to send handshake to client: %v", err)
+			return
 		}
 	}
-	
-	return clientConn, backendConn, nil
-}
 
-func (p *MySQLProxy) readWithTimeout(conn net.Conn, buf []byte, timeout time.Duration) error {
-	if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
-		return err
-	}
-	_, err := conn.Read(buf)
-	if resetErr := conn.SetReadDeadline(time.Time{}); resetErr != nil {
-		return resetErr
-	}
-	return err
-}
-
-func (p *MySQLProxy) writeWithTimeout(conn net.Conn, data []byte, timeout time.Duration) error {
-	if err := conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
-		return err
-	}
-	_, err := conn.Write(data)
-	if resetErr := conn.SetWriteDeadline(time.Time{}); resetErr != nil {
-		return resetErr
-	}
-	return err
+	// Use BaseProxy's timeout-aware proxy connections
+	p.BaseProxy.proxyConnections(clientConn, backendConn)
 }
 
 func (p *MySQLProxy) supportsSSL(handshake []byte) bool {
@@ -179,93 +138,4 @@ func (p *MySQLProxy) isSSLRequest(packet []byte) bool {
 	
 	// CLIENT_SSL flag is 0x0800
 	return (capabilities & 0x0800) != 0
-}
-
-// MySQLConnectionPool manages a pool of backend connections for MySQL
-type MySQLConnectionPool struct {
-	mu          sync.RWMutex
-	connections map[string]*mysqlPooledConn
-	maxConns    int
-	backend     string
-	timeout     time.Duration
-}
-
-type mysqlPooledConn struct {
-	conn     net.Conn
-	lastUsed time.Time
-	inUse    atomic.Bool
-}
-
-// NewMySQLConnectionPool creates a new connection pool
-func NewMySQLConnectionPool(backend string, maxConns int, timeout time.Duration) *MySQLConnectionPool {
-	return &MySQLConnectionPool{
-		connections: make(map[string]*mysqlPooledConn),
-		maxConns:    maxConns,
-		backend:     backend,
-		timeout:     timeout,
-	}
-}
-
-// GetConnection gets or creates a connection from the pool
-func (p *MySQLConnectionPool) GetConnection(ctx context.Context) (net.Conn, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	
-	// Try to find an idle connection
-	for id, pc := range p.connections {
-		if !pc.inUse.Load() && time.Since(pc.lastUsed) < p.timeout {
-			pc.inUse.Store(true)
-			pc.lastUsed = time.Now()
-			return pc.conn, nil
-		}
-		// Remove stale connections
-		if time.Since(pc.lastUsed) >= p.timeout {
-			pc.conn.Close()
-			delete(p.connections, id)
-		}
-	}
-	
-	// Create new connection if under limit
-	if len(p.connections) < p.maxConns {
-		d := &net.Dialer{
-			Timeout: 10 * time.Second,
-		}
-		conn, err := d.DialContext(ctx, "tcp", p.backend)
-		if err != nil {
-			return nil, err
-		}
-		pc := &mysqlPooledConn{
-			conn:     conn,
-			lastUsed: time.Now(),
-		}
-		pc.inUse.Store(true)
-		p.connections[fmt.Sprintf("%p", conn)] = pc
-		return conn, nil
-	}
-	
-	return nil, fmt.Errorf("connection pool exhausted")
-}
-
-// ReleaseConnection returns a connection to the pool
-func (p *MySQLConnectionPool) ReleaseConnection(conn net.Conn) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	
-	id := fmt.Sprintf("%p", conn)
-	if pc, ok := p.connections[id]; ok {
-		pc.inUse.Store(false)
-		pc.lastUsed = time.Now()
-	}
-}
-
-// Close closes all connections in the pool
-func (p *MySQLConnectionPool) Close() error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	
-	for _, pc := range p.connections {
-		pc.conn.Close()
-	}
-	p.connections = make(map[string]*mysqlPooledConn)
-	return nil
 }

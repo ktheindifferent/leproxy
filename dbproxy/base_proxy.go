@@ -10,37 +10,42 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	
+	"github.com/artyom/leproxy/internal/config"
+	"github.com/artyom/leproxy/internal/metrics"
 )
 
 const (
-	DefaultConnectTimeout = 10 * time.Second
-	DefaultIdleTimeout    = 5 * time.Minute
-	DefaultReadTimeout    = 30 * time.Second
-	DefaultWriteTimeout   = 30 * time.Second
-	TLSHandshakeByte     = 0x16
+	DefaultConnectTimeout    = 10 * time.Second
+	DefaultReadTimeout       = 30 * time.Second
+	DefaultWriteTimeout      = 30 * time.Second
+	DefaultIdleTimeout       = 5 * time.Minute
+	DefaultKeepaliveInterval = 30 * time.Second
+	DefaultBufferSize        = 32 * 1024 // 32KB
+	TLSHandshakeByte         = 0x16
 )
 
 type ProxyHandler interface {
-	HandleProtocolNegotiation(ctx context.Context, clientConn, backendConn net.Conn) (net.Conn, net.Conn, error)
+	HandleProtocolNegotiation(clientConn, backendConn net.Conn) (net.Conn, net.Conn, error)
 	GetProtocolName() string
 }
 
 type BaseProxy struct {
-	Backend   string
-	TLSConfig *tls.Config
-	EnableTLS bool
-	Handler   ProxyHandler
-	
-	// Connection management
-	activeConnections int64
-	shutdown          chan struct{}
-	wg                sync.WaitGroup
-	
-	// Timeouts
-	ConnectTimeout time.Duration
-	IdleTimeout    time.Duration
-	ReadTimeout    time.Duration
-	WriteTimeout   time.Duration
+	Backend        string
+	TLSConfig      *tls.Config
+	EnableTLS      bool
+	Handler        ProxyHandler
+	TimeoutConfig  *config.ProxyTimeoutConfig
+	timeoutMetrics *TimeoutMetrics
+}
+
+// TimeoutMetrics tracks timeout-related metrics
+type TimeoutMetrics struct {
+	ReadTimeouts  atomic.Uint64
+	WriteTimeouts atomic.Uint64
+	IdleTimeouts  atomic.Uint64
+	TotalBytes    atomic.Uint64
+	Retries       atomic.Uint64
 }
 
 func NewBaseProxy(backend string, tlsConfig *tls.Config, handler ProxyHandler) *BaseProxy {
@@ -49,206 +54,284 @@ func NewBaseProxy(backend string, tlsConfig *tls.Config, handler ProxyHandler) *
 		TLSConfig:      tlsConfig,
 		EnableTLS:      tlsConfig != nil,
 		Handler:        handler,
-		shutdown:       make(chan struct{}),
-		ConnectTimeout: DefaultConnectTimeout,
-		IdleTimeout:    DefaultIdleTimeout,
-		ReadTimeout:    DefaultReadTimeout,
-		WriteTimeout:   DefaultWriteTimeout,
+		TimeoutConfig:  defaultTimeoutConfig(),
+		timeoutMetrics: &TimeoutMetrics{},
+	}
+}
+
+// NewBaseProxyWithTimeout creates a new BaseProxy with custom timeout configuration
+func NewBaseProxyWithTimeout(backend string, tlsConfig *tls.Config, handler ProxyHandler, timeoutConfig *config.ProxyTimeoutConfig) *BaseProxy {
+	if timeoutConfig == nil {
+		timeoutConfig = defaultTimeoutConfig()
+	}
+	return &BaseProxy{
+		Backend:        backend,
+		TLSConfig:      tlsConfig,
+		EnableTLS:      tlsConfig != nil,
+		Handler:        handler,
+		TimeoutConfig:  timeoutConfig,
+		timeoutMetrics: &TimeoutMetrics{},
+	}
+}
+
+func defaultTimeoutConfig() *config.ProxyTimeoutConfig {
+	return &config.ProxyTimeoutConfig{
+		ConnectTimeout:           config.Duration(DefaultConnectTimeout),
+		ReadTimeout:              config.Duration(DefaultReadTimeout),
+		WriteTimeout:             config.Duration(DefaultWriteTimeout),
+		IdleTimeout:              config.Duration(DefaultIdleTimeout),
+		KeepaliveInterval:        config.Duration(DefaultKeepaliveInterval),
+		EnableKeepalive:          true,
+		BufferSize:               DefaultBufferSize,
+		EnableExponentialBackoff: true,
+		MaxRetries:               3,
+		RetryDelay:               config.Duration(time.Second),
 	}
 }
 
 func (p *BaseProxy) Serve(listener net.Listener) error {
 	for {
-		select {
-		case <-p.shutdown:
-			return nil
-		default:
-		}
-		
 		clientConn, err := listener.Accept()
 		if err != nil {
-			select {
-			case <-p.shutdown:
-				return nil
-			default:
-				return fmt.Errorf("failed to accept connection: %w", err)
-			}
+			return fmt.Errorf("failed to accept connection: %w", err)
 		}
-		
-		p.wg.Add(1)
-		atomic.AddInt64(&p.activeConnections, 1)
 		go p.handleConnection(clientConn)
 	}
 }
 
 func (p *BaseProxy) handleConnection(clientConn net.Conn) {
-	defer p.wg.Done()
-	defer atomic.AddInt64(&p.activeConnections, -1)
 	defer clientConn.Close()
-	
-	// Create context with cancellation for this connection
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	
-	// Set initial timeouts
-	if err := p.setConnectionTimeouts(clientConn); err != nil {
-		log.Printf("Failed to set client connection timeouts: %v", err)
-		return
-	}
 
-	backendConn, err := p.connectToBackendWithContext(ctx)
+	backendConn, err := p.connectToBackend()
 	if err != nil {
 		log.Printf("Failed to connect to %s backend %s: %v", 
 			p.Handler.GetProtocolName(), p.Backend, err)
 		return
 	}
 	defer backendConn.Close()
-	
-	// Set backend connection timeouts
-	if err := p.setConnectionTimeouts(backendConn); err != nil {
-		log.Printf("Failed to set backend connection timeouts: %v", err)
-		return
-	}
 
-	clientConn, backendConn, err = p.Handler.HandleProtocolNegotiation(ctx, clientConn, backendConn)
+	clientConn, backendConn, err = p.Handler.HandleProtocolNegotiation(clientConn, backendConn)
 	if err != nil {
 		log.Printf("Protocol negotiation failed for %s: %v", 
 			p.Handler.GetProtocolName(), err)
 		return
 	}
 
-	p.proxyConnectionsWithContext(ctx, clientConn, backendConn)
+	p.proxyConnections(clientConn, backendConn)
 }
 
 func (p *BaseProxy) connectToBackend() (net.Conn, error) {
-	return net.DialTimeout("tcp", p.Backend, p.ConnectTimeout)
-}
-
-func (p *BaseProxy) connectToBackendWithContext(ctx context.Context) (net.Conn, error) {
-	d := &net.Dialer{
-		Timeout: p.ConnectTimeout,
+	timeout := time.Duration(p.TimeoutConfig.ConnectTimeout)
+	if timeout == 0 {
+		timeout = DefaultConnectTimeout
 	}
-	return d.DialContext(ctx, "tcp", p.Backend)
-}
-
-func (p *BaseProxy) setConnectionTimeouts(conn net.Conn) error {
-	now := time.Now()
-	if err := conn.SetDeadline(now.Add(p.IdleTimeout)); err != nil {
-		return err
+	
+	conn, err := net.DialTimeout("tcp", p.Backend, timeout)
+	if err != nil {
+		return nil, err
 	}
-	return nil
+	
+	// Configure TCP keepalive if enabled
+	if p.TimeoutConfig.EnableKeepalive {
+		if tcpConn, ok := conn.(*net.TCPConn); ok {
+			tcpConn.SetKeepAlive(true)
+			tcpConn.SetKeepAlivePeriod(time.Duration(p.TimeoutConfig.KeepaliveInterval))
+		}
+	}
+	
+	return conn, nil
 }
 
 func (p *BaseProxy) proxyConnections(clientConn, backendConn net.Conn) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	p.proxyConnectionsWithContext(ctx, clientConn, backendConn)
-}
-
-func (p *BaseProxy) proxyConnectionsWithContext(ctx context.Context, clientConn, backendConn net.Conn) {
+	
 	var wg sync.WaitGroup
 	wg.Add(2)
 	
-	// Channel to signal when either copy operation completes
-	done := make(chan struct{})
-	stopCopy := make(chan struct{})
-
-	copyData := func(dst, src net.Conn, direction string) {
+	// Create channels to signal completion
+	done := make(chan struct{}, 2)
+	
+	// Copy data with timeout handling
+	copyWithTimeout := func(dst, src net.Conn, direction string) {
 		defer wg.Done()
+		defer func() { done <- struct{}{} }()
 		
-		buf := make([]byte, 32*1024) // 32KB buffer
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-p.shutdown:
-				return
-			case <-stopCopy:
-				return
-			default:
+		err := p.copyDataWithTimeout(ctx, dst, src, direction)
+		if err != nil && err != io.EOF && err != context.Canceled {
+			log.Printf("%s proxy %s error: %v",
+				p.Handler.GetProtocolName(), direction, err)
+		}
+		
+		// Signal the other goroutine to stop
+		cancel()
+	}
+	
+	go copyWithTimeout(backendConn, clientConn, "client->backend")
+	go copyWithTimeout(clientConn, backendConn, "backend->client")
+	
+	// Wait for both goroutines to complete
+	wg.Wait()
+}
+
+// copyDataWithTimeout performs data copying with timeout and retry logic
+func (p *BaseProxy) copyDataWithTimeout(ctx context.Context, dst, src net.Conn, direction string) error {
+	bufferSize := p.TimeoutConfig.BufferSize
+	if bufferSize <= 0 {
+		bufferSize = DefaultBufferSize
+	}
+	
+	buffer := make([]byte, bufferSize)
+	idleTimeout := time.Duration(p.TimeoutConfig.IdleTimeout)
+	readTimeout := time.Duration(p.TimeoutConfig.ReadTimeout)
+	writeTimeout := time.Duration(p.TimeoutConfig.WriteTimeout)
+	
+	var (
+		totalBytes   int64
+		retryCount   int
+		retryDelay   = time.Duration(p.TimeoutConfig.RetryDelay)
+		lastActivity = time.Now()
+	)
+	
+	for {
+		// Check if context is cancelled
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		
+		// Set read deadline
+		if readTimeout > 0 {
+			src.SetReadDeadline(time.Now().Add(readTimeout))
+		}
+		
+		// Read from source
+		n, readErr := src.Read(buffer)
+		
+		if n > 0 {
+			// Set write deadline
+			if writeTimeout > 0 {
+				dst.SetWriteDeadline(time.Now().Add(writeTimeout))
 			}
 			
-			// Set read deadline for idle timeout
-			if err := src.SetReadDeadline(time.Now().Add(p.ReadTimeout)); err != nil {
-				log.Printf("%s proxy set read deadline error: %v", 
-					p.Handler.GetProtocolName(), err)
-				return
-			}
-			
-			n, readErr := src.Read(buf)
-			if n > 0 {
-				// Set write deadline
-				if err := dst.SetWriteDeadline(time.Now().Add(p.WriteTimeout)); err != nil {
-					log.Printf("%s proxy set write deadline error: %v", 
-						p.Handler.GetProtocolName(), err)
-					return
-				}
-				
-				if _, writeErr := dst.Write(buf[:n]); writeErr != nil {
-					if writeErr != io.EOF {
-						log.Printf("%s proxy %s write error: %v", 
-							p.Handler.GetProtocolName(), direction, writeErr)
+			// Write to destination
+			written := 0
+			for written < n {
+				w, writeErr := dst.Write(buffer[written:n])
+				if writeErr != nil {
+					if p.shouldRetry(writeErr, retryCount) {
+						p.timeoutMetrics.Retries.Add(1)
+						retryCount++
+						time.Sleep(p.calculateBackoff(retryCount, retryDelay))
+						continue
 					}
-					return
+					
+					// Track timeout metrics
+					if isTimeout(writeErr) {
+						p.timeoutMetrics.WriteTimeouts.Add(1)
+						metrics.RecordTimeout(p.Handler.GetProtocolName(), "write", direction)
+					}
+					return writeErr
 				}
+				written += w
 			}
 			
-			if readErr != nil {
-				if readErr != io.EOF {
-					log.Printf("%s proxy %s read error: %v", 
-						p.Handler.GetProtocolName(), direction, readErr)
-				}
-				return
+			totalBytes += int64(n)
+			p.timeoutMetrics.TotalBytes.Add(uint64(n))
+			lastActivity = time.Now()
+			retryCount = 0 // Reset retry count on successful operation
+		}
+		
+		// Check for idle timeout
+		if idleTimeout > 0 && time.Since(lastActivity) > idleTimeout {
+			p.timeoutMetrics.IdleTimeouts.Add(1)
+			metrics.RecordTimeout(p.Handler.GetProtocolName(), "idle", direction)
+			return fmt.Errorf("connection idle timeout exceeded")
+		}
+		
+		if readErr != nil {
+			if readErr == io.EOF {
+				return nil // Normal termination
 			}
+			
+			if p.shouldRetry(readErr, retryCount) {
+				p.timeoutMetrics.Retries.Add(1)
+				retryCount++
+				time.Sleep(p.calculateBackoff(retryCount, retryDelay))
+				continue
+			}
+			
+			// Track timeout metrics
+			if isTimeout(readErr) {
+				p.timeoutMetrics.ReadTimeouts.Add(1)
+				metrics.RecordTimeout(p.Handler.GetProtocolName(), "read", direction)
+			}
+			
+			return readErr
 		}
 	}
-
-	go copyData(backendConn, clientConn, "client->backend")
-	go copyData(clientConn, backendConn, "backend->client")
-	
-	// Monitor for completion
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-	
-	// Wait for either completion or shutdown signal
-	select {
-	case <-done:
-		// Both copy operations completed
-	case <-p.shutdown:
-		// Shutdown requested - stop copy operations
-		close(stopCopy)
-		// Force close connections to unblock reads
-		clientConn.Close()
-		backendConn.Close()
-		// Wait for goroutines to finish
-		<-done
-	}
 }
 
-// Shutdown gracefully shuts down the proxy
-func (p *BaseProxy) Shutdown(ctx context.Context) error {
-	close(p.shutdown)
-	
-	done := make(chan struct{})
-	go func() {
-		p.wg.Wait()
-		close(done)
-	}()
-	
-	select {
-	case <-done:
-		return nil
-	case <-ctx.Done():
-		return fmt.Errorf("shutdown timeout exceeded, %d connections still active", 
-			atomic.LoadInt64(&p.activeConnections))
+// shouldRetry determines if an error is retryable
+func (p *BaseProxy) shouldRetry(err error, retryCount int) bool {
+	if !p.TimeoutConfig.EnableExponentialBackoff {
+		return false
 	}
+	
+	if retryCount >= p.TimeoutConfig.MaxRetries {
+		return false
+	}
+	
+	// Check if it's a temporary network error
+	if netErr, ok := err.(net.Error); ok {
+		return netErr.Temporary()
+	}
+	
+	return false
 }
 
-// GetActiveConnections returns the number of active connections
-func (p *BaseProxy) GetActiveConnections() int64 {
-	return atomic.LoadInt64(&p.activeConnections)
+// calculateBackoff calculates the backoff delay with exponential increase
+func (p *BaseProxy) calculateBackoff(retryCount int, baseDelay time.Duration) time.Duration {
+	if !p.TimeoutConfig.EnableExponentialBackoff {
+		return baseDelay
+	}
+	
+	// Exponential backoff: delay * 2^(retryCount-1)
+	delay := baseDelay
+	for i := 1; i < retryCount; i++ {
+		delay *= 2
+		if delay > 30*time.Second {
+			delay = 30 * time.Second // Cap at 30 seconds
+			break
+		}
+	}
+	
+	return delay
+}
+
+// isTimeout checks if an error is a timeout error
+func isTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	
+	if netErr, ok := err.(net.Error); ok {
+		return netErr.Timeout()
+	}
+	
+	return false
+}
+
+// GetTimeoutMetrics returns current timeout metrics
+func (p *BaseProxy) GetTimeoutMetrics() map[string]uint64 {
+	return map[string]uint64{
+		"read_timeouts":  p.timeoutMetrics.ReadTimeouts.Load(),
+		"write_timeouts": p.timeoutMetrics.WriteTimeouts.Load(),
+		"idle_timeouts":  p.timeoutMetrics.IdleTimeouts.Load(),
+		"total_bytes":    p.timeoutMetrics.TotalBytes.Load(),
+		"retries":        p.timeoutMetrics.Retries.Load(),
+	}
 }
 
 func (p *BaseProxy) UpgradeToTLS(conn net.Conn) (*tls.Conn, error) {

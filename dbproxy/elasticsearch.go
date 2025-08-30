@@ -2,41 +2,39 @@ package dbproxy
 
 import (
 	"crypto/tls"
-	"fmt"
 	"io"
 	"log"
 	"net"
-	"time"
 )
 
 type ElasticsearchProxy struct {
-	Backend   string
-	TLSConfig *tls.Config
-	EnableTLS bool
+	*BaseProxy
 }
 
 func NewElasticsearchProxy(backend string, tlsConfig *tls.Config) *ElasticsearchProxy {
 	return &ElasticsearchProxy{
-		Backend:   backend,
-		TLSConfig: tlsConfig,
-		EnableTLS: tlsConfig != nil,
+		BaseProxy: NewBaseProxy(backend, tlsConfig, &elasticsearchHandler{}),
 	}
+}
+
+// elasticsearchHandler implements ProxyHandler for Elasticsearch
+type elasticsearchHandler struct{}
+
+func (h *elasticsearchHandler) GetProtocolName() string {
+	return "Elasticsearch"
+}
+
+func (h *elasticsearchHandler) HandleProtocolNegotiation(clientConn, backendConn net.Conn) (net.Conn, net.Conn, error) {
+	return clientConn, backendConn, nil
 }
 
 func (p *ElasticsearchProxy) Serve(listener net.Listener) error {
-	for {
-		clientConn, err := listener.Accept()
-		if err != nil {
-			return fmt.Errorf("failed to accept connection: %w", err)
-		}
-		go p.handleConnection(clientConn)
-	}
+	return p.BaseProxy.Serve(listener)
 }
-
 func (p *ElasticsearchProxy) handleConnection(clientConn net.Conn) {
 	defer clientConn.Close()
 
-	backendConn, err := net.DialTimeout("tcp", p.Backend, 10*time.Second)
+	backendConn, err := p.connectToBackend()
 	if err != nil {
 		log.Printf("Failed to connect to Elasticsearch backend %s: %v", p.Backend, err)
 		return

@@ -6,37 +6,36 @@ import (
 	"io"
 	"log"
 	"net"
-	"time"
 )
 
 type LDAPProxy struct {
-	Backend   string
-	TLSConfig *tls.Config
-	EnableTLS bool
+	*BaseProxy
 }
 
 func NewLDAPProxy(backend string, tlsConfig *tls.Config) *LDAPProxy {
 	return &LDAPProxy{
-		Backend:   backend,
-		TLSConfig: tlsConfig,
-		EnableTLS: tlsConfig != nil,
+		BaseProxy: NewBaseProxy(backend, tlsConfig, &ldapHandler{}),
 	}
+}
+
+// ldapHandler implements ProxyHandler for LDAP
+type ldapHandler struct{}
+
+func (h *ldapHandler) GetProtocolName() string {
+	return "LDAP"
+}
+
+func (h *ldapHandler) HandleProtocolNegotiation(clientConn, backendConn net.Conn) (net.Conn, net.Conn, error) {
+	return clientConn, backendConn, nil
 }
 
 func (p *LDAPProxy) Serve(listener net.Listener) error {
-	for {
-		clientConn, err := listener.Accept()
-		if err != nil {
-			return fmt.Errorf("failed to accept connection: %w", err)
-		}
-		go p.handleConnection(clientConn)
-	}
+	return p.BaseProxy.Serve(listener)
 }
-
 func (p *LDAPProxy) handleConnection(clientConn net.Conn) {
 	defer clientConn.Close()
 
-	backendConn, err := net.DialTimeout("tcp", p.Backend, 10*time.Second)
+	backendConn, err := p.connectToBackend()
 	if err != nil {
 		log.Printf("Failed to connect to LDAP backend %s: %v", p.Backend, err)
 		return

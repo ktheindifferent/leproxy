@@ -68,7 +68,7 @@ func NewManager(config *Config) (*Manager, error) {
 
 	// Ensure cache directory exists
 	if err := os.MkdirAll(config.CacheDir, 0700); err != nil {
-		return nil, errors.Wrap(err, errors.ErrConfiguration, "failed to create cache directory")
+		return nil, errors.Wrap(err, errors.ErrorTypeConfiguration, "failed to create cache directory", "")
 	}
 
 	manager := &autocert.Manager{
@@ -88,8 +88,14 @@ func NewManager(config *Config) (*Manager, error) {
 		config:  config,
 	}
 	
-	// Initialize renewal manager
+	// Initialize renewal manager with error recovery
 	m.renewalManager = NewRenewalManager(m)
+	
+	// Check if renewal manager has initialization errors
+	if m.renewalManager.initError != nil {
+		logger.Warn("Renewal manager initialized with errors", map[string]interface{}{"error": m.renewalManager.initError, "note": "Certificate renewal may have limited functionality"})
+		// Continue with degraded functionality rather than failing completely
+	}
 	
 	return m, nil
 }
@@ -102,36 +108,80 @@ func (m *Manager) GetTLSConfig() *tls.Config {
 	return config
 }
 
-// StartRenewalManager starts the automatic renewal process
-func (m *Manager) StartRenewalManager(ctx context.Context) {
-	m.renewalManager.Start(ctx)
+// StartRenewalManager starts the automatic renewal process with error handling
+func (m *Manager) StartRenewalManager(ctx context.Context) error {
+	if m.renewalManager == nil {
+		return errors.New(errors.ErrorTypeConfiguration, "renewal manager not initialized", "manager", fmt.Errorf("nil"))
+	}
+	
+	if err := m.renewalManager.Start(ctx); err != nil {
+		return errors.Wrap(err, errors.ErrorTypeConfiguration, "failed to start renewal manager", "")
+	}
+	
+	return nil
 }
 
-// StopRenewalManager stops the automatic renewal process
+// StopRenewalManager stops the automatic renewal process gracefully
 func (m *Manager) StopRenewalManager() {
-	m.renewalManager.Stop()
+	if m.renewalManager != nil {
+		logger.Info("Stopping renewal manager")
+		m.renewalManager.Stop()
+	}
 }
 
 // SetRenewalAlertHandler sets the alert handler for renewal failures
 func (m *Manager) SetRenewalAlertHandler(handler AlertHandler) {
-	m.renewalManager.SetAlertHandler(handler)
+	if m.renewalManager != nil {
+		m.renewalManager.SetAlertHandler(handler)
+	} else {
+		logger.Warn("Cannot set alert handler - renewal manager not initialized")
+	}
 }
 
 // GetRenewalStatus returns the current renewal status for all domains
 func (m *Manager) GetRenewalStatus() map[string]*RenewalStatus {
-	return m.renewalManager.GetStatus()
+	if m.renewalManager != nil {
+		return m.renewalManager.GetStatus()
+	}
+	return make(map[string]*RenewalStatus)
 }
 
 // GetRenewalHistory returns the renewal history
 func (m *Manager) GetRenewalHistory() []RenewalHistory {
-	return m.renewalManager.GetHistory()
+	if m.renewalManager != nil {
+		return m.renewalManager.GetHistory()
+	}
+	return []RenewalHistory{}
 }
 
 // RenewCertificates checks and renews certificates if needed (deprecated - use StartRenewalManager)
 func (m *Manager) RenewCertificates(ctx context.Context) error {
 	logger.Info("Checking certificates for renewal (deprecated method - use StartRenewalManager)")
-	m.renewalManager.checkAndRenewAll(ctx)
+	if m.renewalManager != nil {
+		m.renewalManager.checkAndRenewAll(ctx)
+	} else {
+		return errors.New(errors.ErrorTypeConfiguration, "renewal manager not initialized", "manager", fmt.Errorf("nil"))
+	}
 	return nil
+}
+
+// GetRenewalHealth returns the health status of the renewal manager
+func (m *Manager) GetRenewalHealth() map[string]interface{} {
+	if m.renewalManager != nil {
+		return m.renewalManager.GetHealthStatus()
+	}
+	return map[string]interface{}{
+		"healthy": false,
+		"error":   "renewal manager not initialized",
+	}
+}
+
+// IsRenewalHealthy returns true if the renewal manager is healthy
+func (m *Manager) IsRenewalHealthy() bool {
+	if m.renewalManager != nil {
+		return m.renewalManager.IsHealthy()
+	}
+	return false
 }
 
 func validateConfig(config *Config) error {
@@ -171,7 +221,7 @@ func configureACMEClient(manager *autocert.Manager, config *Config) error {
 	if directoryURL != "" {
 		parsedURL, err := url.Parse(directoryURL)
 		if err != nil {
-			return errors.Wrap(err, errors.ErrConfiguration, "invalid ACME directory URL")
+			return errors.Wrap(err, errors.ErrorTypeConfiguration, "invalid ACME directory URL", "")
 		}
 
 		client := &acme.Client{
@@ -180,17 +230,14 @@ func configureACMEClient(manager *autocert.Manager, config *Config) error {
 
 		// Configure EAB if provided
 		if config.EABKID != "" && config.EABHMAC != "" {
-			logger.Info("Configuring External Account Binding", "provider", config.Provider)
+			logger.Info("Configuring External Account Binding", map[string]interface{}{"provider": config.Provider})
 			// EAB configuration would be applied here during account registration
 			// Note: The actual EAB implementation requires modifying the account registration
 			// process which happens internally in autocert.Manager
 		}
 
 		manager.Client = client
-		logger.Info("ACME client configured", 
-			"provider", config.Provider,
-			"directory", directoryURL,
-			"test_mode", config.TestMode)
+		logger.Info("ACME client configured", map[string]interface{}{"provider": config.Provider, "directory": directoryURL, "test_mode": config.TestMode})
 	}
 
 	return nil
@@ -213,7 +260,7 @@ func getDirectoryURL(config *Config) string {
 		case ProviderGoogle:
 			return GoogleStagingURL
 		default:
-			logger.Warn("No staging environment available for provider", "provider", provider)
+			logger.Warn("No staging environment available for provider", map[string]interface{}{"provider": provider})
 		}
 	}
 
@@ -286,7 +333,7 @@ func (b *BackupManager) Backup() error {
 	backupPath := filepath.Join(b.backupDir, "backup-"+timestamp)
 	
 	if err := os.MkdirAll(backupPath, 0700); err != nil {
-		return errors.Wrap(err, errors.ErrFileSystem, "failed to create backup directory")
+		return errors.Wrap(err, errors.ErrorTypeIO, "failed to create backup directory", "")
 	}
 
 	// Copy certificate files

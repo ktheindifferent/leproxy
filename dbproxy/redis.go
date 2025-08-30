@@ -2,311 +2,155 @@ package dbproxy
 
 import (
 	"bufio"
-	"context"
 	"crypto/tls"
-	"fmt"
+	"io"
 	"log"
 	"net"
 	"strings"
-	"sync"
-	"sync/atomic"
-	"time"
 )
 
-// RedisProxy handles Redis protocol proxying with optional TLS support
 type RedisProxy struct {
 	*BaseProxy
 }
 
-// NewRedisProxy creates a new Redis proxy instance
 func NewRedisProxy(backend string, tlsConfig *tls.Config) *RedisProxy {
-	handler := &redisHandler{}
-	base := NewBaseProxy(backend, tlsConfig, handler)
-	proxy := &RedisProxy{
-		BaseProxy: base,
+	return &RedisProxy{
+		BaseProxy: NewBaseProxy(backend, tlsConfig, &redisHandler{}),
 	}
-	handler.proxy = proxy
-	return proxy
 }
 
 // redisHandler implements ProxyHandler for Redis
-type redisHandler struct {
-	proxy *RedisProxy
-}
+type redisHandler struct{}
 
 func (h *redisHandler) GetProtocolName() string {
 	return "Redis"
 }
 
-func (h *redisHandler) HandleProtocolNegotiation(ctx context.Context, clientConn, backendConn net.Conn) (net.Conn, net.Conn, error) {
+func (h *redisHandler) HandleProtocolNegotiation(clientConn, backendConn net.Conn) (net.Conn, net.Conn, error) {
+	return clientConn, backendConn, nil
+}
+
+func (p *RedisProxy) Serve(listener net.Listener) error {
+	return p.BaseProxy.Serve(listener)
+}
+func (p *RedisProxy) handleConnection(clientConn net.Conn) {
+	defer clientConn.Close()
+
+	backendConn, err := p.connectToBackend()
+	if err != nil {
+		log.Printf("Failed to connect to Redis backend %s: %v", p.Backend, err)
+		return
+	}
+	defer backendConn.Close()
+
 	// Handle TLS if enabled
-	if h.proxy.EnableTLS {
-		return h.handleTLSNegotiation(ctx, clientConn, backendConn)
-	}
-	return clientConn, backendConn, nil
-}
-
-func (h *redisHandler) handleTLSNegotiation(ctx context.Context, clientConn, backendConn net.Conn) (net.Conn, net.Conn, error) {
-	// Create a channel to signal completion
-	done := make(chan struct{})
-	defer close(done)
-	
-	// Monitor context cancellation
-	go func() {
-		select {
-		case <-ctx.Done():
-			clientConn.Close()
-			backendConn.Close()
-		case <-done:
-		}
-	}()
-	
-	// Check if client sends STARTTLS command
-	clientReader := bufio.NewReader(clientConn)
-	
-	// Set read deadline for peeking
-	if err := clientConn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
-		return clientConn, backendConn, fmt.Errorf("failed to set read deadline: %w", err)
-	}
-	
-	// Peek at the first command
-	firstLine, err := clientReader.Peek(64)
-	
-	// Reset deadline
-	if err := clientConn.SetReadDeadline(time.Time{}); err != nil {
-		return clientConn, backendConn, fmt.Errorf("failed to reset read deadline: %w", err)
-	}
-	
-	if err == nil && h.isStartTLSCommand(firstLine) {
-		// Read the full STARTTLS command
-		_, err := clientReader.ReadString('\n')
-		if err != nil {
-			return clientConn, backendConn, fmt.Errorf("failed to read STARTTLS command: %w", err)
-		}
+	if p.EnableTLS {
+		// Check if client sends STARTTLS command
+		clientReader := bufio.NewReader(clientConn)
 		
-		// Send +OK response
-		if err := h.proxy.writeWithTimeout(clientConn, []byte("+OK\r\n"), 5*time.Second); err != nil {
-			return clientConn, backendConn, fmt.Errorf("failed to send STARTTLS response: %w", err)
-		}
-		
-		// Upgrade to TLS
-		tlsConn := tls.Server(clientConn, h.proxy.TLSConfig)
-		// Set handshake timeout
-		if err := tlsConn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
-			return clientConn, backendConn, fmt.Errorf("failed to set TLS deadline: %w", err)
-		}
-		if err := tlsConn.Handshake(); err != nil {
-			return clientConn, backendConn, fmt.Errorf("TLS handshake failed: %w", err)
-		}
-		// Reset deadline after handshake
-		if err := tlsConn.SetDeadline(time.Time{}); err != nil {
-			return clientConn, backendConn, fmt.Errorf("failed to reset TLS deadline: %w", err)
-		}
-		clientConn = tlsConn
-		
-		// Create new reader for TLS connection
-		clientReader = bufio.NewReader(clientConn)
-	} else {
-		// No STARTTLS, but we can still offer TLS wrapper if client connects with TLS directly
-		// Try to detect if this is already a TLS handshake
-		if len(firstLine) > 0 && firstLine[0] == 0x16 {
-			// Looks like TLS handshake
-			tlsConn := tls.Server(clientConn, h.proxy.TLSConfig)
-			// Set handshake timeout
-			if err := tlsConn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
-				return clientConn, backendConn, fmt.Errorf("failed to set TLS deadline: %w", err)
+		// Peek at the first command
+		firstLine, err := clientReader.Peek(64)
+		if err == nil && p.isStartTLSCommand(firstLine) {
+			// Read the full STARTTLS command
+			_, err := clientReader.ReadString('\n')
+			if err != nil {
+				log.Printf("Failed to read STARTTLS command: %v", err)
+				return
 			}
+
+			// Send +OK response
+			if _, err := clientConn.Write([]byte("+OK\r\n")); err != nil {
+				log.Printf("Failed to send STARTTLS response: %v", err)
+				return
+			}
+
+			// Upgrade to TLS
+			tlsConn := tls.Server(clientConn, p.TLSConfig)
 			if err := tlsConn.Handshake(); err != nil {
-				// Not a TLS connection, continue without TLS
-				log.Printf("TLS handshake failed, continuing without TLS: %v", err)
-			} else {
-				// Reset deadline after handshake
-				if err := tlsConn.SetDeadline(time.Time{}); err != nil {
-					return clientConn, backendConn, fmt.Errorf("failed to reset TLS deadline: %w", err)
+				log.Printf("TLS handshake failed: %v", err)
+				return
+			}
+			clientConn = tlsConn
+			
+			// Create new reader for TLS connection
+			clientReader = bufio.NewReader(clientConn)
+		} else {
+			// No STARTTLS, but we can still offer TLS wrapper if client connects with TLS directly
+			if p.EnableTLS {
+				// Try to detect TLS handshake (starts with 0x16 for TLS)
+				if len(firstLine) > 0 && firstLine[0] == 0x16 {
+					tlsConn := tls.Server(clientConn, p.TLSConfig)
+					if err := tlsConn.Handshake(); err != nil {
+						// Not a TLS connection, continue with plain text
+						log.Printf("Client connected without TLS, continuing with plain connection")
+					} else {
+						clientConn = tlsConn
+						clientReader = bufio.NewReader(clientConn)
+					}
 				}
-				clientConn = tlsConn
 			}
 		}
-		// If we have buffered data, we need to create a connection that includes it
-		if clientReader.Buffered() > 0 {
-			buffered, _ := clientReader.Peek(clientReader.Buffered())
-			clientConn = NewPrefixConn(clientConn, buffered)
+
+		// For connections that used a reader, we need to handle buffered data
+		if clientReader != nil {
+			errCh := make(chan error, 2)
+			go func() {
+				err := p.proxyWithReader(clientReader, clientConn, backendConn)
+				errCh <- err
+			}()
+			go func() {
+				_, err := io.Copy(clientConn, backendConn)
+				if err != nil && err != io.EOF {
+					log.Printf("Error copying from backend to client: %v", err)
+				}
+				errCh <- err
+			}()
+			
+			// Wait for either direction to finish
+			<-errCh
+			return
+		}
+	}
+
+	// Standard bidirectional copy for non-TLS or after TLS negotiation
+	errCh := make(chan error, 2)
+	go func() {
+		_, err := io.Copy(backendConn, clientConn)
+		errCh <- err
+	}()
+	go func() {
+		_, err := io.Copy(clientConn, backendConn)
+		errCh <- err
+	}()
+
+	// Wait for either direction to finish
+	<-errCh
+}
+
+func (p *RedisProxy) isStartTLSCommand(data []byte) bool {
+	// Redis STARTTLS command in RESP protocol
+	// Could be: *1\r\n$8\r\nSTARTTLS\r\n
+	// Or simple: STARTTLS\r\n
+	str := string(data)
+	return strings.Contains(strings.ToUpper(str), "STARTTLS")
+}
+
+func (p *RedisProxy) proxyWithReader(reader *bufio.Reader, client, backend net.Conn) error {
+	// First, flush any buffered data
+	if reader.Buffered() > 0 {
+		buffered, err := reader.Peek(reader.Buffered())
+		if err == nil {
+			if _, err := backend.Write(buffered); err != nil {
+				return err
+			}
+			reader.Discard(len(buffered))
 		}
 	}
 	
-	return clientConn, backendConn, nil
-}
-
-func (h *redisHandler) isStartTLSCommand(data []byte) bool {
-	cmd := strings.ToUpper(string(data))
-	return strings.Contains(cmd, "STARTTLS") || strings.Contains(cmd, "*1\r\n$8\r\nSTARTTLS")
-}
-
-func (p *RedisProxy) writeWithTimeout(conn net.Conn, data []byte, timeout time.Duration) error {
-	if err := conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
-		return err
-	}
-	_, err := conn.Write(data)
-	if resetErr := conn.SetWriteDeadline(time.Time{}); resetErr != nil {
-		return resetErr
+	// Then continue with regular copy
+	_, err := io.Copy(backend, reader)
+	if err != nil && err != io.EOF {
+		log.Printf("Error copying from client to backend: %v", err)
 	}
 	return err
-}
-
-// RedisConnectionPool manages a pool of backend connections for Redis
-type RedisConnectionPool struct {
-	mu          sync.RWMutex
-	connections map[string]*redisPooledConn
-	maxConns    int
-	backend     string
-	timeout     time.Duration
-	pingTicker  *time.Ticker
-	stopPing    chan struct{}
-	wg          sync.WaitGroup
-}
-
-type redisPooledConn struct {
-	conn     net.Conn
-	lastUsed time.Time
-	inUse    atomic.Bool
-}
-
-// NewRedisConnectionPool creates a new connection pool with health checking
-func NewRedisConnectionPool(backend string, maxConns int, timeout time.Duration) *RedisConnectionPool {
-	pool := &RedisConnectionPool{
-		connections: make(map[string]*redisPooledConn),
-		maxConns:    maxConns,
-		backend:     backend,
-		timeout:     timeout,
-		pingTicker:  time.NewTicker(30 * time.Second),
-		stopPing:    make(chan struct{}),
-	}
-	
-	// Start background health checker
-	pool.wg.Add(1)
-	go pool.healthChecker()
-	
-	return pool
-}
-
-// healthChecker periodically pings connections to keep them alive
-func (p *RedisConnectionPool) healthChecker() {
-	defer p.wg.Done()
-	
-	for {
-		select {
-		case <-p.stopPing:
-			return
-		case <-p.pingTicker.C:
-			p.pingConnections()
-		}
-	}
-}
-
-// pingConnections sends PING to idle connections
-func (p *RedisConnectionPool) pingConnections() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	
-	for id, pc := range p.connections {
-		if !pc.inUse.Load() {
-			// Send PING command
-			if err := pc.conn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
-				pc.conn.Close()
-				delete(p.connections, id)
-				continue
-			}
-			
-			if _, err := pc.conn.Write([]byte("*1\r\n$4\r\nPING\r\n")); err != nil {
-				pc.conn.Close()
-				delete(p.connections, id)
-				continue
-			}
-			
-			// Read PONG response
-			if err := pc.conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
-				pc.conn.Close()
-				delete(p.connections, id)
-				continue
-			}
-			
-			buf := make([]byte, 7) // "+PONG\r\n"
-			if _, err := pc.conn.Read(buf); err != nil {
-				pc.conn.Close()
-				delete(p.connections, id)
-			}
-			
-			// Reset deadlines
-			pc.conn.SetDeadline(time.Time{})
-		}
-	}
-}
-
-// GetConnection gets or creates a connection from the pool
-func (p *RedisConnectionPool) GetConnection(ctx context.Context) (net.Conn, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	
-	// Try to find an idle connection
-	for id, pc := range p.connections {
-		if !pc.inUse.Load() && time.Since(pc.lastUsed) < p.timeout {
-			pc.inUse.Store(true)
-			pc.lastUsed = time.Now()
-			return pc.conn, nil
-		}
-		// Remove stale connections
-		if time.Since(pc.lastUsed) >= p.timeout {
-			pc.conn.Close()
-			delete(p.connections, id)
-		}
-	}
-	
-	// Create new connection if under limit
-	if len(p.connections) < p.maxConns {
-		d := &net.Dialer{
-			Timeout: 10 * time.Second,
-		}
-		conn, err := d.DialContext(ctx, "tcp", p.backend)
-		if err != nil {
-			return nil, err
-		}
-		pc := &redisPooledConn{
-			conn:     conn,
-			lastUsed: time.Now(),
-		}
-		pc.inUse.Store(true)
-		p.connections[fmt.Sprintf("%p", conn)] = pc
-		return conn, nil
-	}
-	
-	return nil, fmt.Errorf("connection pool exhausted")
-}
-
-// ReleaseConnection returns a connection to the pool
-func (p *RedisConnectionPool) ReleaseConnection(conn net.Conn) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	
-	id := fmt.Sprintf("%p", conn)
-	if pc, ok := p.connections[id]; ok {
-		pc.inUse.Store(false)
-		pc.lastUsed = time.Now()
-	}
-}
-
-// Close closes all connections in the pool
-func (p *RedisConnectionPool) Close() error {
-	// Stop health checker
-	close(p.stopPing)
-	p.pingTicker.Stop()
-	p.wg.Wait()
-	
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	
-	for _, pc := range p.connections {
-		pc.conn.Close()
-	}
-	p.connections = make(map[string]*redisPooledConn)
-	return nil
 }

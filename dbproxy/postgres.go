@@ -2,14 +2,11 @@
 package dbproxy
 
 import (
-	"context"
 	"crypto/tls"
 	"encoding/binary"
 	"fmt"
+	"log"
 	"net"
-	"sync"
-	"sync/atomic"
-	"time"
 )
 
 // PostgresProxy handles PostgreSQL protocol proxying with optional TLS support
@@ -19,60 +16,58 @@ type PostgresProxy struct {
 
 // NewPostgresProxy creates a new PostgreSQL proxy instance
 func NewPostgresProxy(backend string, tlsConfig *tls.Config) *PostgresProxy {
-	handler := &postgresHandler{}
-	base := NewBaseProxy(backend, tlsConfig, handler)
-	proxy := &PostgresProxy{
-		BaseProxy: base,
+	return &PostgresProxy{
+		BaseProxy: NewBaseProxy(backend, tlsConfig, &postgresHandler{}),
 	}
-	handler.proxy = proxy
-	return proxy
 }
 
 // postgresHandler implements ProxyHandler for PostgreSQL
-type postgresHandler struct {
-	proxy *PostgresProxy
-}
+type postgresHandler struct{}
 
 func (h *postgresHandler) GetProtocolName() string {
 	return "PostgreSQL"
 }
 
-func (h *postgresHandler) HandleProtocolNegotiation(ctx context.Context, clientConn, backendConn net.Conn) (net.Conn, net.Conn, error) {
-	if h.proxy.EnableTLS {
-		return h.proxy.handleSSLNegotiation(ctx, clientConn, backendConn)
-	}
+func (h *postgresHandler) HandleProtocolNegotiation(clientConn, backendConn net.Conn) (net.Conn, net.Conn, error) {
+	// For PostgreSQL, we handle SSL negotiation if needed
+	// The base proxy will handle TLS if configured
 	return clientConn, backendConn, nil
+}
+
+// Serve delegates to BaseProxy.Serve
+func (p *PostgresProxy) Serve(listener net.Listener) error {
+	return p.BaseProxy.Serve(listener)
+}
+
+// handleConnection manages a single client connection to the PostgreSQL backend
+func (p *PostgresProxy) handleConnection(clientConn net.Conn) {
+	defer clientConn.Close()
+
+	backendConn, err := p.connectToBackend()
+	if err != nil {
+		log.Printf("Failed to connect to Postgres backend %s: %v", p.Backend, err)
+		return
+	}
+	defer backendConn.Close()
+
+	if p.EnableTLS {
+		clientConn, backendConn, err = p.handleSSLNegotiation(clientConn, backendConn)
+		if err != nil {
+			log.Printf("SSL negotiation failed: %v", err)
+			return
+		}
+	}
+
+	// Use the BaseProxy's timeout-aware proxy connections
+	p.BaseProxy.proxyConnections(clientConn, backendConn)
 }
 
 // handleSSLNegotiation manages the PostgreSQL SSL negotiation protocol
 // It intercepts the SSLRequest packet and establishes TLS connections when requested
-func (p *PostgresProxy) handleSSLNegotiation(ctx context.Context, clientConn, backendConn net.Conn) (net.Conn, net.Conn, error) {
-	// Create a channel to signal completion
-	done := make(chan struct{})
-	defer close(done)
-	
-	// Monitor context cancellation
-	go func() {
-		select {
-		case <-ctx.Done():
-			clientConn.Close()
-			backendConn.Close()
-		case <-done:
-		}
-	}()
-	// Set read timeout for SSL negotiation
-	if err := clientConn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
-		return clientConn, backendConn, fmt.Errorf("failed to set read deadline: %w", err)
-	}
-	
+func (p *PostgresProxy) handleSSLNegotiation(clientConn, backendConn net.Conn) (net.Conn, net.Conn, error) {
 	// Read the initial packet which might be an SSL request
 	buf := make([]byte, 8)
 	n, err := clientConn.Read(buf)
-	
-	// Reset deadline after read
-	if err := clientConn.SetReadDeadline(time.Time{}); err != nil {
-		return clientConn, backendConn, fmt.Errorf("failed to reset read deadline: %w", err)
-	}
 	if err != nil {
 		return clientConn, backendConn, fmt.Errorf("failed to read SSL request: %w", err)
 	}
@@ -94,32 +89,16 @@ func (p *PostgresProxy) handleSSLNegotiation(ctx context.Context, clientConn, ba
 			}
 
 			tlsClient := tls.Server(clientConn, p.TLSConfig)
-			// Set handshake timeout
-			if err := tlsClient.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
-				return clientConn, backendConn, fmt.Errorf("failed to set TLS deadline: %w", err)
-			}
 			if err := tlsClient.Handshake(); err != nil {
 				return clientConn, backendConn, fmt.Errorf("TLS handshake with client failed: %w", err)
-			}
-			// Reset deadline after handshake
-			if err := tlsClient.SetDeadline(time.Time{}); err != nil {
-				return clientConn, backendConn, fmt.Errorf("failed to reset TLS deadline: %w", err)
 			}
 			clientConn = tlsClient
 
 			tlsBackend := tls.Client(backendConn, &tls.Config{
 				InsecureSkipVerify: true,
 			})
-			// Set handshake timeout
-			if err := tlsBackend.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
-				return clientConn, backendConn, fmt.Errorf("failed to set backend TLS deadline: %w", err)
-			}
 			if err := tlsBackend.Handshake(); err != nil {
 				return clientConn, backendConn, fmt.Errorf("TLS handshake with backend failed: %w", err)
-			}
-			// Reset deadline after handshake
-			if err := tlsBackend.SetDeadline(time.Time{}); err != nil {
-				return clientConn, backendConn, fmt.Errorf("failed to reset backend TLS deadline: %w", err)
 			}
 			backendConn = tlsBackend
 		} else {
@@ -134,95 +113,6 @@ func (p *PostgresProxy) handleSSLNegotiation(ctx context.Context, clientConn, ba
 	}
 
 	return clientConn, backendConn, nil
-}
-
-// ConnectionPool manages a pool of backend connections for PostgreSQL
-type PostgresConnectionPool struct {
-	mu          sync.RWMutex
-	connections map[string]*postgresPooledConn
-	maxConns    int
-	backend     string
-	timeout     time.Duration
-}
-
-type postgresPooledConn struct {
-	conn     net.Conn
-	lastUsed time.Time
-	inUse    atomic.Bool
-}
-
-// NewPostgresConnectionPool creates a new connection pool
-func NewPostgresConnectionPool(backend string, maxConns int, timeout time.Duration) *PostgresConnectionPool {
-	return &PostgresConnectionPool{
-		connections: make(map[string]*postgresPooledConn),
-		maxConns:    maxConns,
-		backend:     backend,
-		timeout:     timeout,
-	}
-}
-
-// GetConnection gets or creates a connection from the pool
-func (p *PostgresConnectionPool) GetConnection(ctx context.Context) (net.Conn, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	
-	// Try to find an idle connection
-	for id, pc := range p.connections {
-		if !pc.inUse.Load() && time.Since(pc.lastUsed) < p.timeout {
-			pc.inUse.Store(true)
-			pc.lastUsed = time.Now()
-			return pc.conn, nil
-		}
-		// Remove stale connections
-		if time.Since(pc.lastUsed) >= p.timeout {
-			pc.conn.Close()
-			delete(p.connections, id)
-		}
-	}
-	
-	// Create new connection if under limit
-	if len(p.connections) < p.maxConns {
-		d := &net.Dialer{
-			Timeout: 10 * time.Second,
-		}
-		conn, err := d.DialContext(ctx, "tcp", p.backend)
-		if err != nil {
-			return nil, err
-		}
-		pc := &postgresPooledConn{
-			conn:     conn,
-			lastUsed: time.Now(),
-		}
-		pc.inUse.Store(true)
-		p.connections[fmt.Sprintf("%p", conn)] = pc
-		return conn, nil
-	}
-	
-	return nil, fmt.Errorf("connection pool exhausted")
-}
-
-// ReleaseConnection returns a connection to the pool
-func (p *PostgresConnectionPool) ReleaseConnection(conn net.Conn) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	
-	id := fmt.Sprintf("%p", conn)
-	if pc, ok := p.connections[id]; ok {
-		pc.inUse.Store(false)
-		pc.lastUsed = time.Now()
-	}
-}
-
-// Close closes all connections in the pool
-func (p *PostgresConnectionPool) Close() error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	
-	for _, pc := range p.connections {
-		pc.conn.Close()
-	}
-	p.connections = make(map[string]*postgresPooledConn)
-	return nil
 }
 
 const postgresSSLRequestCode = 80877103

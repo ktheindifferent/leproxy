@@ -2,7 +2,6 @@ package acme
 
 import (
 	"encoding/json"
-	"fmt"
 	"html/template"
 	"net/http"
 	"sort"
@@ -198,7 +197,7 @@ func (dh *DashboardHandler) handleAPIRenew(w http.ResponseWriter, r *http.Reques
 	
 	// Trigger renewal
 	go func() {
-		logger.Info("Manual renewal triggered", "domain", req.Domain)
+		logger.Info("Manual renewal triggered", map[string]interface{}{"domain": req.Domain})
 		dh.manager.renewalManager.checkAndRenewCertificate(r.Context(), req.Domain)
 	}()
 	

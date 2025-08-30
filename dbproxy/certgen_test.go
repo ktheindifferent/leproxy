@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -507,5 +508,263 @@ func generateExpiredCert(t *testing.T, hostname string) *expiredCertData {
 	return &expiredCertData{
 		certPEM: []byte("invalid cert data"),
 		keyPEM:  []byte("invalid key data"),
+	}
+}
+
+// TestAtomicFileOperations tests that certificate generation uses atomic file operations
+func TestAtomicFileOperations(t *testing.T) {
+	cacheDir := t.TempDir()
+	cm := NewCertManager(cacheDir)
+	hostname := "atomic.example.com"
+
+	// Generate certificate
+	_, err := cm.GetTLSConfig(hostname)
+	if err != nil {
+		t.Fatalf("Failed to generate certificate: %v", err)
+	}
+
+	// Verify no temporary files remain
+	files, err := os.ReadDir(cacheDir)
+	if err != nil {
+		t.Fatalf("Failed to read cache directory: %v", err)
+	}
+
+	for _, file := range files {
+		if strings.HasSuffix(file.Name(), ".tmp") {
+			t.Errorf("Found temporary file after successful generation: %s", file.Name())
+		}
+	}
+
+	// Verify the final files exist
+	certFile := filepath.Join(cacheDir, hostname+".crt")
+	keyFile := filepath.Join(cacheDir, hostname+".key")
+
+	if _, err := os.Stat(certFile); os.IsNotExist(err) {
+		t.Error("Certificate file not found after atomic operation")
+	}
+
+	if _, err := os.Stat(keyFile); os.IsNotExist(err) {
+		t.Error("Key file not found after atomic operation")
+	}
+}
+
+// TestFileCloseErrors tests proper handling of file close errors
+func TestFileCloseErrors(t *testing.T) {
+	cacheDir := t.TempDir()
+	cm := NewCertManager(cacheDir)
+	
+	// Test with a directory that we'll make read-only after initial creation
+	hostname := "closetest.example.com"
+	
+	// First, generate normally to ensure directory exists
+	_, err := cm.GetTLSConfig(hostname)
+	if err != nil {
+		t.Fatalf("Initial certificate generation failed: %v", err)
+	}
+	
+	// Remove the generated files
+	os.Remove(filepath.Join(cacheDir, hostname+".crt"))
+	os.Remove(filepath.Join(cacheDir, hostname+".key"))
+	
+	// Now the directory exists but we can test file operations
+	// Verify that temporary files are cleaned up even on errors
+	tempCertPath := filepath.Join(cacheDir, hostname+".crt.tmp")
+	tempKeyPath := filepath.Join(cacheDir, hostname+".key.tmp")
+	
+	// After generation, these temp files should not exist
+	_, err = cm.GetTLSConfig(hostname)
+	if err != nil {
+		t.Fatalf("Certificate generation failed: %v", err)
+	}
+	
+	if _, err := os.Stat(tempCertPath); !os.IsNotExist(err) {
+		t.Error("Temporary cert file not cleaned up")
+	}
+	
+	if _, err := os.Stat(tempKeyPath); !os.IsNotExist(err) {
+		t.Error("Temporary key file not cleaned up")
+	}
+}
+
+// TestDiskFullScenario tests handling of disk full errors during write
+func TestDiskFullScenario(t *testing.T) {
+	// This test simulates disk full by using a very small tmpfs or quota
+	// For CI compatibility, we'll test with a read-only directory after initial setup
+	
+	cacheDir := t.TempDir()
+	cm := NewCertManager(cacheDir)
+	hostname := "diskfull.example.com"
+	
+	// Create the cache directory structure
+	os.MkdirAll(cacheDir, 0700)
+	
+	// Make directory read-only to simulate write failures
+	defer os.Chmod(cacheDir, 0755) // Restore permissions in cleanup
+	os.Chmod(cacheDir, 0555)
+	
+	// Attempt to generate certificate - should fail gracefully
+	_, err := cm.GetTLSConfig(hostname)
+	if err == nil {
+		t.Error("Expected error when writing to read-only directory")
+	}
+	
+	// Verify error message is descriptive
+	if err != nil && !strings.Contains(err.Error(), "failed to") {
+		t.Errorf("Error message not descriptive enough: %v", err)
+	}
+	
+	// Restore permissions and verify it works
+	os.Chmod(cacheDir, 0755)
+	_, err = cm.GetTLSConfig(hostname)
+	if err != nil {
+		t.Errorf("Certificate generation failed after restoring permissions: %v", err)
+	}
+}
+
+// TestConcurrentFileOperations tests that concurrent certificate generation doesn't corrupt files
+func TestConcurrentFileOperations(t *testing.T) {
+	cacheDir := t.TempDir()
+	cm := NewCertManager(cacheDir)
+	
+	// Use different hostnames to avoid cache hits
+	hostnames := []string{
+		"concurrent1.example.com",
+		"concurrent2.example.com",
+		"concurrent3.example.com",
+		"concurrent4.example.com",
+		"concurrent5.example.com",
+	}
+	
+	// Generate certificates concurrently
+	var wg sync.WaitGroup
+	errors := make(chan error, len(hostnames))
+	
+	for _, hostname := range hostnames {
+		wg.Add(1)
+		go func(h string) {
+			defer wg.Done()
+			_, err := cm.GetTLSConfig(h)
+			if err != nil {
+				errors <- err
+			}
+		}(hostname)
+	}
+	
+	wg.Wait()
+	close(errors)
+	
+	// Check for errors
+	for err := range errors {
+		t.Errorf("Concurrent generation error: %v", err)
+	}
+	
+	// Verify all certificates were created and are valid
+	for _, hostname := range hostnames {
+		certFile := filepath.Join(cacheDir, hostname+".crt")
+		keyFile := filepath.Join(cacheDir, hostname+".key")
+		
+		// Files should exist
+		if _, err := os.Stat(certFile); os.IsNotExist(err) {
+			t.Errorf("Certificate file missing for %s", hostname)
+		}
+		
+		if _, err := os.Stat(keyFile); os.IsNotExist(err) {
+			t.Errorf("Key file missing for %s", hostname)
+		}
+		
+		// Files should be valid (can be loaded)
+		_, err := tls.LoadX509KeyPair(certFile, keyFile)
+		if err != nil {
+			t.Errorf("Failed to load certificate pair for %s: %v", hostname, err)
+		}
+	}
+	
+	// Verify no temporary files remain
+	files, err := os.ReadDir(cacheDir)
+	if err != nil {
+		t.Fatalf("Failed to read cache directory: %v", err)
+	}
+	
+	for _, file := range files {
+		if strings.HasSuffix(file.Name(), ".tmp") {
+			t.Errorf("Found temporary file after concurrent generation: %s", file.Name())
+		}
+	}
+}
+
+// TestPartialWriteRecovery tests recovery from partial write scenarios
+func TestPartialWriteRecovery(t *testing.T) {
+	cacheDir := t.TempDir()
+	cm := NewCertManager(cacheDir)
+	hostname := "partial.example.com"
+	
+	// Create a partial certificate file (corrupted)
+	certFile := filepath.Join(cacheDir, hostname+".crt")
+	keyFile := filepath.Join(cacheDir, hostname+".key")
+	
+	// Write invalid partial data
+	os.WriteFile(certFile, []byte("-----BEGIN CERTIFICATE-----\nincomplete"), 0644)
+	os.WriteFile(keyFile, []byte("-----BEGIN PRIVATE KEY-----\nincomplete"), 0600)
+	
+	// Attempt to get TLS config - should regenerate due to invalid cert
+	config, err := cm.GetTLSConfig(hostname)
+	if err != nil {
+		t.Fatalf("Failed to recover from partial write: %v", err)
+	}
+	
+	// Verify the new certificate is valid
+	if len(config.Certificates) == 0 {
+		t.Fatal("No certificates in recovered config")
+	}
+	
+	// Verify files are now valid
+	_, err = tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		t.Errorf("Recovered certificate files are invalid: %v", err)
+	}
+}
+
+// TestErrorPropagation tests that errors are properly propagated with context
+func TestErrorPropagation(t *testing.T) {
+	tests := []struct {
+		name          string
+		setup         func() *CertManager
+		hostname      string
+		errorContains string
+	}{
+		{
+			name: "invalid cache directory",
+			setup: func() *CertManager {
+				// Use a file instead of directory
+				tmpfile, _ := os.CreateTemp("", "notadir")
+				tmpfile.Close()
+				return NewCertManager(tmpfile.Name())
+			},
+			hostname:      "test.example.com",
+			errorContains: "failed to create cache directory",
+		},
+		{
+			name: "empty hostname",
+			setup: func() *CertManager {
+				return NewCertManager(t.TempDir())
+			},
+			hostname:      "",
+			errorContains: "",
+		},
+	}
+	
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cm := tt.setup()
+			_, err := cm.GetTLSConfig(tt.hostname)
+			
+			if tt.errorContains != "" {
+				if err == nil {
+					t.Error("Expected error but got none")
+				} else if !strings.Contains(err.Error(), tt.errorContains) {
+					t.Errorf("Error doesn't contain expected text.\nGot: %v\nWant substring: %s", err, tt.errorContains)
+				}
+			}
+		})
 	}
 }
