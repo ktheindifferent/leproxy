@@ -57,14 +57,23 @@ func (p *SMTPProxy) handleConnection(clientConn net.Conn) {
 	errc := make(chan error, 2)
 	go func() {
 		_, err := io.Copy(backendConn, clientConn)
+		if err != nil && err != io.EOF {
+			log.Printf("SMTP proxy error copying client->backend: %v", err)
+		}
 		errc <- err
 	}()
 	go func() {
 		_, err := io.Copy(clientConn, backendConn)
+		if err != nil && err != io.EOF {
+			log.Printf("SMTP proxy error copying backend->client: %v", err)
+		}
 		errc <- err
 	}()
 
-	<-errc
+	// Wait for first error
+	if err := <-errc; err != nil && err != io.EOF {
+		log.Printf("SMTP proxy connection closed with error: %v", err)
+	}
 }
 
 func (p *SMTPProxy) handleSTARTTLS(clientConn, backendConn net.Conn) (net.Conn, net.Conn, error) {
