@@ -522,7 +522,7 @@ func TestPostgresProxyGoroutineLeaks(t *testing.T) {
 			
 			// Read response
 			buf := make([]byte, 1)
-			conn.Read(buf)
+			_, _ = conn.Read(buf) // Ignore error as connection may be closed
 		}()
 	}
 	
@@ -616,10 +616,10 @@ func TestMySQLProxyGoroutineLeaks(t *testing.T) {
 			
 			// Read handshake
 			buf := make([]byte, 100)
-			conn.Read(buf)
+			_, _ = conn.Read(buf) // Ignore error as handshake may not complete
 			
 			// Send some data
-			conn.Write([]byte("test"))
+			_, _ = conn.Write([]byte("test")) // Ignore error as connection may be closed
 		}()
 	}
 	
@@ -705,11 +705,13 @@ func TestRedisProxyGoroutineLeaks(t *testing.T) {
 			defer conn.Close()
 			
 			// Send PING command
-			conn.Write([]byte("*1\r\n$4\r\nPING\r\n"))
+			if _, err := conn.Write([]byte("*1\r\n$4\r\nPING\r\n")); err != nil {
+				return // Connection may be closed
+			}
 			
 			// Read response
 			buf := make([]byte, 10)
-			conn.Read(buf)
+			_, _ = conn.Read(buf) // Ignore error as connection may be closed
 		}()
 	}
 	

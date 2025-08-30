@@ -573,7 +573,7 @@ func TestEdgeCasesConnectionHandling(t *testing.T) {
 				}
 				
 				// Send partial request
-				conn.Write([]byte("GET / HTTP/1.1\r\nHost: "))
+				_, _ = conn.Write([]byte("GET / HTTP/1.1\r\nHost: ")) // Ignore error as we're testing abrupt disconnect
 				// Abruptly close
 				conn.Close()
 			},
@@ -591,7 +591,9 @@ func TestEdgeCasesConnectionHandling(t *testing.T) {
 				// Send request very slowly
 				req := []byte("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
 				for _, b := range req {
-					conn.Write([]byte{b})
+					if _, err := conn.Write([]byte{b}); err != nil {
+						break // Connection may be closed by server
+					}
 					time.Sleep(10 * time.Millisecond)
 				}
 			},

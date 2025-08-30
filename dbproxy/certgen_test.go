@@ -467,8 +467,13 @@ func TestInvalidCacheDirectory(t *testing.T) {
 		{
 			name: "file instead of directory",
 			setupDir: func() string {
-				tmpfile, _ := os.CreateTemp("", "certcache")
-				tmpfile.Close()
+				tmpfile, err := os.CreateTemp("", "certcache")
+				if err != nil {
+					t.Fatalf("Failed to create temp file: %v", err)
+				}
+				if err := tmpfile.Close(); err != nil {
+					t.Fatalf("Failed to close temp file: %v", err)
+				}
 				return tmpfile.Name()
 			},
 			cleanupDir: func(path string) {
@@ -703,8 +708,12 @@ func TestPartialWriteRecovery(t *testing.T) {
 	keyFile := filepath.Join(cacheDir, hostname+".key")
 	
 	// Write invalid partial data
-	os.WriteFile(certFile, []byte("-----BEGIN CERTIFICATE-----\nincomplete"), 0644)
-	os.WriteFile(keyFile, []byte("-----BEGIN PRIVATE KEY-----\nincomplete"), 0600)
+	if err := os.WriteFile(certFile, []byte("-----BEGIN CERTIFICATE-----\nincomplete"), 0644); err != nil {
+		t.Fatalf("Failed to write corrupted certificate file: %v", err)
+	}
+	if err := os.WriteFile(keyFile, []byte("-----BEGIN PRIVATE KEY-----\nincomplete"), 0600); err != nil {
+		t.Fatalf("Failed to write corrupted key file: %v", err)
+	}
 	
 	// Attempt to get TLS config - should regenerate due to invalid cert
 	config, err := cm.GetTLSConfig(hostname)
@@ -736,8 +745,13 @@ func TestErrorPropagation(t *testing.T) {
 			name: "invalid cache directory",
 			setup: func() *CertManager {
 				// Use a file instead of directory
-				tmpfile, _ := os.CreateTemp("", "notadir")
-				tmpfile.Close()
+				tmpfile, err := os.CreateTemp("", "notadir")
+				if err != nil {
+					t.Fatalf("Failed to create temp file: %v", err)
+				}
+				if err := tmpfile.Close(); err != nil {
+					t.Fatalf("Failed to close temp file: %v", err)
+				}
 				return NewCertManager(tmpfile.Name())
 			},
 			hostname:      "test.example.com",

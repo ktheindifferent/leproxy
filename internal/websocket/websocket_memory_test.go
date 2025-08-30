@@ -28,7 +28,9 @@ func TestMemoryLeak(t *testing.T) {
 			"Upgrade: websocket\r\n" +
 			"Connection: Upgrade\r\n" +
 			"\r\n"
-		conn.Write([]byte(response))
+		if _, err := conn.Write([]byte(response)); err != nil {
+			return
+		}
 		
 		// Echo messages with small delay
 		buf := make([]byte, 1024)
@@ -39,7 +41,9 @@ func TestMemoryLeak(t *testing.T) {
 			}
 			if n > 0 {
 				time.Sleep(10 * time.Millisecond)
-				conn.Write(buf[:n])
+				if _, err := conn.Write(buf[:n]); err != nil {
+					return
+				}
 			}
 		}
 	}))
@@ -88,7 +92,9 @@ func TestMemoryLeak(t *testing.T) {
 					"Upgrade: websocket\r\n" +
 					"Connection: Upgrade\r\n" +
 					"\r\n"
-				conn.Write([]byte(upgradeReq))
+				if _, err := conn.Write([]byte(upgradeReq)); err != nil {
+					return
+				}
 				
 				// Read response
 				buf := make([]byte, 1024)
@@ -98,9 +104,11 @@ func TestMemoryLeak(t *testing.T) {
 					// Send and receive a few messages
 					for k := 0; k < 5; k++ {
 						testData := []byte("Test message")
-						conn.Write(testData)
+						if _, err := conn.Write(testData); err != nil {
+							break
+						}
 						conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-						conn.Read(buf)
+						_, _ = conn.Read(buf)
 					}
 				}
 			}()
@@ -157,7 +165,9 @@ func TestGoroutineLeakUnderLoad(t *testing.T) {
 			"Upgrade: websocket\r\n" +
 			"Connection: Upgrade\r\n" +
 			"\r\n"
-		conn.Write([]byte(response))
+		if _, err := conn.Write([]byte(response)); err != nil {
+			return
+		}
 		
 		// Read and discard data
 		buf := make([]byte, 1024)
@@ -206,7 +216,7 @@ func TestGoroutineLeakUnderLoad(t *testing.T) {
 				"Upgrade: websocket\r\n" +
 				"Connection: Upgrade\r\n" +
 				"\r\n"
-			conn.Write([]byte(upgradeReq))
+			_, _ = conn.Write([]byte(upgradeReq)) // Ignore error as we're immediately closing
 			
 			// Abruptly close connection
 			conn.Close()

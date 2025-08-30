@@ -45,7 +45,9 @@ func TestGoroutineCleanup(t *testing.T) {
 			"Upgrade: websocket\r\n" +
 			"Connection: Upgrade\r\n" +
 			"\r\n"
-		conn.Write([]byte(response))
+		if _, err := conn.Write([]byte(response)); err != nil {
+			return
+		}
 		
 		// Echo server
 		buf := make([]byte, 1024)
@@ -55,7 +57,9 @@ func TestGoroutineCleanup(t *testing.T) {
 				return
 			}
 			if n > 0 {
-				conn.Write(buf[:n])
+				if _, err := conn.Write(buf[:n]); err != nil {
+					return
+				}
 			}
 		}
 	}))
@@ -196,10 +200,12 @@ func TestMaxMessageSize(t *testing.T) {
 			"Upgrade: websocket\r\n" +
 			"Connection: Upgrade\r\n" +
 			"\r\n"
-		conn.Write([]byte(response))
+		if _, err := conn.Write([]byte(response)); err != nil {
+			return
+		}
 		
 		// Echo large messages
-		io.Copy(conn, conn)
+		_, _ = io.Copy(conn, conn) // Ignore error as connection will be closed
 	}))
 	defer wsServer.Close()
 	
@@ -624,7 +630,7 @@ func TestContextCancellation(t *testing.T) {
 		resp, err := http.DefaultClient.Do(req)
 		if err == nil {
 			defer resp.Body.Close()
-			io.Copy(io.Discard, resp.Body)
+			_, _ = io.Copy(io.Discard, resp.Body) // Ignore error as we're testing shutdown
 		}
 	}()
 	
