@@ -47,6 +47,10 @@ import (
 
 // main initializes the application with default configuration values and starts the proxy server
 func main() {
+	// Create root context with signal handling
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	
 	// Initialize default configuration for the reverse proxy
 	args := runArgs{
 		Addr:     ":https",                   // Default HTTPS listen address
@@ -74,7 +78,7 @@ func main() {
 	}
 	
 	// Start the proxy server with the configured arguments
-	if err := run(args); err != nil {
+	if err := run(ctx, args); err != nil {
 		logger.Error("Server failed to start", map[string]interface{}{"error": err})
 		os.Exit(1)
 	}
@@ -128,7 +132,7 @@ type runArgs struct {
 }
 
 // run initializes and starts the proxy server with the provided configuration
-func run(args runArgs) error {
+func run(ctx context.Context, args runArgs) error {
 	if err := validateConfig(args); err != nil {
 		return errors.Wrap(err, errors.ErrorTypeConfiguration, "configuration validation", "leproxy")
 	}
@@ -143,7 +147,7 @@ func run(args runArgs) error {
 	// Initialize tracing if configured
 	var tracerProvider *tracing.TracerProvider
 	if args.TracingEndpoint != "" {
-		tracer, err := tracing.InitTracer("leproxy", args.TracingEndpoint, args.TracingExporter)
+		tracer, err := tracing.InitTracerWithContext(ctx, "leproxy", args.TracingEndpoint, args.TracingExporter)
 		if err != nil {
 			logger.Warn("Failed to initialize tracing", map[string]interface{}{
 				"error": err,
@@ -215,27 +219,27 @@ func run(args runArgs) error {
 		logger.Warn("Failed to start database proxies", map[string]interface{}{"error": err})
 	}
 
-	srv, httpHandler, err := setupServerWithEnhancements(args)
+	srv, httpHandler, err := setupServerWithEnhancements(ctx, args)
 	if err != nil {
 		return errors.Wrap(err, errors.ErrorTypeConfiguration, "server setup", "leproxy")
 	}
 
 	configureServerTimeouts(srv, args)
 
-	if err := startRedirectServerIfNeeded(args.HTTP, httpHandler); err != nil {
+	if err := startRedirectServerIfNeeded(ctx, args.HTTP, httpHandler); err != nil {
 		return errors.Wrap(err, errors.ErrorTypeConnection, "start HTTP redirect server", "leproxy")
 	}
 	
 	// Set up graceful shutdown with coordinator
-	shutdownCoordinator := setupGracefulShutdownCoordinator(srv, tracerProvider)
-	safegoroutine.Go("shutdown-coordinator", func() {
-		shutdownCoordinator.HandleSignals()
+	shutdownCoordinator := setupGracefulShutdownCoordinator(ctx, srv, tracerProvider)
+	safegoroutine.GoWithContext(ctx, "shutdown-coordinator", func() {
+		shutdownCoordinator.HandleSignalsWithContext(ctx)
 	})
 	
 	// Register shutdown hooks for external components if needed
 	registerShutdownHooks(shutdownCoordinator, args, metricsServer)
 
-	return startHTTPSServer(srv, args.Idle)
+	return startHTTPSServer(ctx, srv, args.Idle)
 }
 
 func validateConfig(args runArgs) error {
@@ -264,14 +268,14 @@ func initializeDatabaseProxies(args runArgs) error {
 	if args.DBConf == "" {
 		return nil
 	}
-	return startDatabaseProxies(args.DBConf, args.DBCertCache)
+	return startDatabaseProxies(ctx, args.DBConf, args.DBCertCache)
 }
 
-func startRedirectServerIfNeeded(httpAddr string, handler http.Handler) error {
+func startRedirectServerIfNeeded(ctx context.Context, httpAddr string, handler http.Handler) error {
 	if httpAddr == "" {
 		return nil
 	}
-	return startHTTPRedirectServer(httpAddr, handler)
+	return startHTTPRedirectServer(ctx, httpAddr, handler)
 }
 
 func configureServerTimeouts(srv *http.Server, args runArgs) {
@@ -284,10 +288,10 @@ func configureServerTimeouts(srv *http.Server, args runArgs) {
 	}
 }
 
-func startHTTPRedirectServer(addr string, handler http.Handler) error {
+func startHTTPRedirectServer(ctx context.Context, addr string, handler http.Handler) error {
 	errCh := make(chan error, 1)
 	
-	safegoroutine.GoCritical("http-redirect-server", func() {
+	safegoroutine.GoCriticalWithContext(ctx, "http-redirect-server", func() {
 		srv := http.Server{
 			Addr:         addr,
 			Handler:      handler,
@@ -317,19 +321,27 @@ func checkServerStartup(errCh chan error) error {
 	}
 }
 
-func startHTTPSServer(srv *http.Server, idleTimeout time.Duration) error {
+func startHTTPSServer(ctx context.Context, srv *http.Server, idleTimeout time.Duration) error {
+	// Handle context cancellation
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		srv.Shutdown(shutdownCtx)
+	}()
+	
 	if shouldUseStandardTLS(srv, idleTimeout) {
 		return srv.ListenAndServeTLS("", "")
 	}
 	
-	return serveWithCustomListener(srv, idleTimeout)
+	return serveWithCustomListener(ctx, srv, idleTimeout)
 }
 
 func shouldUseStandardTLS(srv *http.Server, idleTimeout time.Duration) bool {
 	return srv.ReadTimeout != 0 || srv.WriteTimeout != 0 || idleTimeout == 0
 }
 
-func serveWithCustomListener(srv *http.Server, idleTimeout time.Duration) error {
+func serveWithCustomListener(ctx context.Context, srv *http.Server, idleTimeout time.Duration) error {
 	ln, err := createTCPListener(srv.Addr)
 	if err != nil {
 		return err
@@ -465,7 +477,7 @@ func createTCPListener(addr string) (*net.TCPListener, error) {
 	return tcpLn, nil
 }
 
-func setupServerWithEnhancements(args runArgs) (*http.Server, http.Handler, error) {
+func setupServerWithEnhancements(ctx context.Context, args runArgs) (*http.Server, http.Handler, error) {
 	mapping, err := readMapping(args.Conf)
 	if err != nil {
 		return nil, nil, err
@@ -526,7 +538,7 @@ func setupServerWithEnhancements(args runArgs) (*http.Server, http.Handler, erro
 		return nil, nil, err
 	}
 
-	certManager := createAutocertManager(args.Cache, args.Email, mapping, acmeConfig)
+	certManager := createAutocertManager(ctx, args.Cache, args.Email, mapping, acmeConfig)
 	
 	// Start admin API if configured
 	if args.AdminAddr != "" {
@@ -660,7 +672,7 @@ func validateProviderConfig(provider, email, eabKID, eabHMAC string) error {
 	return nil
 }
 
-func createAutocertManager(cacheDir, email string, mapping map[string]string, config *acmeConfiguration) *autocert.Manager {
+func createAutocertManager(ctx context.Context, cacheDir, email string, mapping map[string]string, config *acmeConfiguration) *autocert.Manager {
 	m := &autocert.Manager{
 		Prompt:     autocert.AcceptTOS,
 		Cache:      autocert.DirCache(cacheDir),
@@ -678,7 +690,7 @@ func createAutocertManager(cacheDir, email string, mapping map[string]string, co
 		eabProviders := []string{"zerossl", "sslcom", "google"}
 		for _, p := range eabProviders {
 			if config.provider == p && config.eabKID != "" && config.eabHMAC != "" {
-				configureEABClient(client, email, config.eabKID, config.eabHMAC, config.provider)
+				configureEABClient(ctx, client, email, config.eabKID, config.eabHMAC, config.provider)
 				break
 			}
 		}
@@ -689,8 +701,7 @@ func createAutocertManager(cacheDir, email string, mapping map[string]string, co
 	return m
 }
 
-func configureEABClient(client *acme.Client, email, eabKID, eabHMAC, provider string) {
-	ctx := context.Background()
+func configureEABClient(ctx context.Context, client *acme.Client, email, eabKID, eabHMAC, provider string) {
 	_, _ = client.Discover(ctx)
 	log.Printf("Configuring %s with EAB credentials (KID: %s)", provider, eabKID)
 }
@@ -1042,14 +1053,14 @@ func startAdminAPI(addr string, certManager *autocert.Manager, mapping map[strin
 	}
 }
 
-func startDatabaseProxies(configFile, certCacheDir string) error {
+func startDatabaseProxies(ctx context.Context, configFile, certCacheDir string) error {
 	configs, err := readDBProxyConfig(configFile)
 	if err != nil {
 		return fmt.Errorf("failed to read database proxy config: %w", err)
 	}
 
 	certManager := createCertManager(certCacheDir)
-	startProxyWorkers(configs, certManager)
+	startProxyWorkers(ctx, configs, certManager)
 
 	return nil
 }
@@ -1061,11 +1072,11 @@ func createCertManager(certCacheDir string) *dbproxy.CertManager {
 	return dbproxy.NewCertManager(certCacheDir)
 }
 
-func startProxyWorkers(configs []dbProxyConfig, certManager *dbproxy.CertManager) {
+func startProxyWorkers(ctx context.Context, configs []dbProxyConfig, certManager *dbproxy.CertManager) {
 	for _, config := range configs {
 		cfg := config // Capture loop variable
-		safegoroutine.GoCritical(fmt.Sprintf("dbproxy-%s-%s", cfg.ProxyType, cfg.ListenAddr), func() {
-			startProxyWorker(cfg, certManager)
+		safegoroutine.GoCriticalWithContext(ctx, fmt.Sprintf("dbproxy-%s-%s", cfg.ProxyType, cfg.ListenAddr), func() {
+			startProxyWorker(ctx, cfg, certManager)
 		}, &safegoroutine.RestartPolicy{
 			MaxRestarts:     5,
 			RestartDelay:    3 * time.Second,
@@ -1076,7 +1087,7 @@ func startProxyWorkers(configs []dbProxyConfig, certManager *dbproxy.CertManager
 	}
 }
 
-func startProxyWorker(cfg dbProxyConfig, certManager *dbproxy.CertManager) {
+func startProxyWorker(ctx context.Context, cfg dbProxyConfig, certManager *dbproxy.CertManager) {
 	if err := startSingleDBProxy(cfg, certManager); err != nil {
 		log.Printf("Failed to start %s proxy on %s: %v", cfg.ProxyType, cfg.ListenAddr, err)
 	}
@@ -1293,7 +1304,7 @@ func setBackendConfig(config *dbProxyConfig, parts []string) {
 }
 
 // setupGracefulShutdownCoordinator configures graceful shutdown for the server and all resources
-func setupGracefulShutdownCoordinator(srv *http.Server, tracerProvider *tracing.TracerProvider) *graceful.ShutdownCoordinator {
+func setupGracefulShutdownCoordinator(ctx context.Context, srv *http.Server, tracerProvider *tracing.TracerProvider) *graceful.ShutdownCoordinator {
 	// Create graceful server configuration
 	cfg := graceful.Config{
 		HTTPServer:      srv,

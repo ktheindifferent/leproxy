@@ -11,6 +11,7 @@ import (
 	"sync"
 	
 	"github.com/artyom/leproxy/internal/safegoroutine"
+)
 
 type MongoDBProxy struct {
 	*BaseProxy
@@ -95,7 +96,7 @@ func (p *MongoDBProxy) handleWireProtocol(clientConn, backendConn net.Conn) {
 	// MongoDB wire protocol aware proxying
 	// This allows us to intercept and modify certain commands if needed
 	
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(context.TODO()) // TODO: Pass context from caller
 	defer cancel()
 	
 	var wg sync.WaitGroup

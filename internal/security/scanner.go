@@ -449,7 +449,7 @@ func (s *Scanner) autoScanLoop() {
 	defer ticker.Stop()
 	
 	for range ticker.C {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+		ctx, cancel := context.WithTimeout(context.TODO(), 30*time.Minute) // TODO: Pass context from scanner initialization
 		s.Scan(ctx, ".")
 		cancel()
 	}

@@ -459,7 +459,7 @@ func (s *Server) HandleSignals() {
 		case syscall.SIGINT, syscall.SIGTERM:
 			// Graceful shutdown
 			logger.Info("Received shutdown signal", map[string]interface{}{"signal": sig.String()})
-			ctx, cancel := context.WithTimeout(context.Background(), s.shutdownTimeout)
+			ctx, cancel := context.WithTimeout(context.Background(), s.shutdownTimeout) // This is OK - it's in the shutdown signal handler
 			defer cancel()
 			
 			if err := s.Shutdown(ctx); err != nil {
@@ -770,24 +770,34 @@ func (s *Server) IsShuttingDown() bool {
 }
 
 func (m *Manager) HandleSignals() {
+	m.HandleSignalsWithContext(context.Background())
+}
+
+func (m *Manager) HandleSignalsWithContext(ctx context.Context) {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	defer signal.Stop(sigChan)
 	
-	for sig := range sigChan {
-		switch sig {
-		case syscall.SIGINT, syscall.SIGTERM:
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			
-			if err := m.ShutdownAll(ctx); err != nil {
-				logger.Error("Manager shutdown failed", map[string]interface{}{"error": err})
-				os.Exit(1)
-			}
-			os.Exit(0)
-			
-		case syscall.SIGHUP:
-			if err := m.ReloadAll(); err != nil {
-				logger.Error("Manager reload failed", map[string]interface{}{"error": err})
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case sig := <-sigChan:
+			switch sig {
+			case syscall.SIGINT, syscall.SIGTERM:
+				shutdownCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+				defer cancel()
+				
+				if err := m.ShutdownAll(shutdownCtx); err != nil {
+					logger.Error("Manager shutdown failed", map[string]interface{}{"error": err})
+					os.Exit(1)
+				}
+				os.Exit(0)
+				
+			case syscall.SIGHUP:
+				if err := m.ReloadAll(); err != nil {
+					logger.Error("Manager reload failed", map[string]interface{}{"error": err})
+				}
 			}
 		}
 	}
@@ -852,7 +862,7 @@ func (sc *ShutdownCoordinator) Shutdown(ctx context.Context) error {
 			defer wg.Done()
 			
 			// Create context with specific timeout for this resource
-			fnCtx, cancel := context.WithTimeout(context.Background(), shutdownFunc.Timeout)
+			fnCtx, cancel := context.WithTimeout(ctx, shutdownFunc.Timeout)
 			defer cancel()
 			
 			// Execute shutdown function
@@ -886,27 +896,37 @@ func (sc *ShutdownCoordinator) Shutdown(ctx context.Context) error {
 
 // HandleSignals handles OS signals for graceful shutdown
 func (sc *ShutdownCoordinator) HandleSignals() {
+	sc.HandleSignalsWithContext(context.Background())
+}
+
+func (sc *ShutdownCoordinator) HandleSignalsWithContext(ctx context.Context) {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	defer signal.Stop(sigChan)
 	
-	for sig := range sigChan {
-		switch sig {
-		case syscall.SIGINT, syscall.SIGTERM:
-			ctx, cancel := context.WithTimeout(context.Background(), sc.shutdownTimeout)
-			defer cancel()
-			
-			if err := sc.Shutdown(ctx); err != nil {
-				// Log the error (assuming logger is available)
-				fmt.Fprintf(os.Stderr, "Shutdown error: %v\n", err)
-				os.Exit(1)
-			}
-			os.Exit(0)
-			
-		case syscall.SIGHUP:
-			// Reload if server has reload function
-			if sc.server.reloadFunc != nil {
-				if err := sc.server.Reload(); err != nil {
-					fmt.Fprintf(os.Stderr, "Reload error: %v\n", err)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case sig := <-sigChan:
+			switch sig {
+			case syscall.SIGINT, syscall.SIGTERM:
+				shutdownCtx, cancel := context.WithTimeout(ctx, sc.shutdownTimeout)
+				defer cancel()
+				
+				if err := sc.Shutdown(shutdownCtx); err != nil {
+					// Log the error (assuming logger is available)
+					fmt.Fprintf(os.Stderr, "Shutdown error: %v\n", err)
+					os.Exit(1)
+				}
+				os.Exit(0)
+				
+			case syscall.SIGHUP:
+				// Reload if server has reload function
+				if sc.server.reloadFunc != nil {
+					if err := sc.server.Reload(); err != nil {
+						fmt.Fprintf(os.Stderr, "Reload error: %v\n", err)
+					}
 				}
 			}
 		}

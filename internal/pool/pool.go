@@ -134,6 +134,10 @@ type Config struct {
 }
 
 func New(cfg Config) (*Pool, error) {
+	return NewWithContext(context.Background(), cfg)
+}
+
+func NewWithContext(ctx context.Context, cfg Config) (*Pool, error) {
 	if cfg.Factory == nil {
 		return nil, errors.New("factory function is required")
 	}
@@ -171,11 +175,11 @@ func New(cfg Config) (*Pool, error) {
 	}
 	
 	// Pre-create minimum connections
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	initCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	
 	for i := 0; i < p.minConns; i++ {
-		conn, err := p.createConn(ctx)
+		conn, err := p.createConn(initCtx)
 		if err != nil {
 			// Clean up any created connections
 			p.Close()
@@ -412,7 +416,7 @@ check:
 	p.stateMu.RUnlock()
 	
 	if healthy < p.minConns && poolOpen {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.TODO(), 5*time.Second) // TODO: Pass context from pool creation
 		defer cancel()
 		
 		for i := healthy; i < p.minConns; i++ {
