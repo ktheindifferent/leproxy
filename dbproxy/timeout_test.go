@@ -138,13 +138,7 @@ func (e *temporaryError) Error() string   { return "temporary error" }
 func (e *temporaryError) Timeout() bool   { return false }
 func (e *temporaryError) Temporary() bool { return true }
 
-// mockHandler implements ProxyHandler for testing
-type mockHandler struct{}
-
-func (h *mockHandler) GetProtocolName() string { return "Mock" }
-func (h *mockHandler) HandleProtocolNegotiation(clientConn, backendConn net.Conn) (net.Conn, net.Conn, error) {
-	return clientConn, backendConn, nil
-}
+// mockHandler removed - defined in goroutine_leak_fixed_test.go
 
 func TestCopyDataWithTimeout_ReadTimeout(t *testing.T) {
 	proxy := NewBaseProxy("test:1234", nil, &mockHandler{})

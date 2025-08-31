@@ -2,7 +2,6 @@ package dbproxy
 
 import (
 	"crypto/tls"
-	"io"
 	"log"
 	"net"
 )
@@ -62,15 +61,6 @@ func (p *ElasticsearchProxy) handleConnection(clientConn net.Conn) {
 		wrappedBackendConn = tlsBackend
 	}
 
-	errc := make(chan error, 2)
-	go func() {
-		_, err := io.Copy(wrappedBackendConn, wrappedClientConn)
-		errc <- err
-	}()
-	go func() {
-		_, err := io.Copy(wrappedClientConn, wrappedBackendConn)
-		errc <- err
-	}()
-
-	<-errc
+	// Use BaseProxy's proxyConnections for proper goroutine management
+	p.BaseProxy.proxyConnections(wrappedClientConn, wrappedBackendConn)
 }

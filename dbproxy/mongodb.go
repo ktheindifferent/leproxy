@@ -1,15 +1,16 @@
 package dbproxy
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"sync"
 	
 	"github.com/artyom/leproxy/internal/safegoroutine"
-)
 
 type MongoDBProxy struct {
 	*BaseProxy
@@ -83,32 +84,10 @@ func (p *MongoDBProxy) handleConnection(clientConn net.Conn) {
 	// Check if we need to handle isMaster command for TLS negotiation
 	if p.EnableTLS {
 		// MongoDB wire protocol detection
-		safegoroutine.Go(fmt.Sprintf("mongodb-wire-protocol-%s", clientConn.RemoteAddr()), func() {
-			p.handleWireProtocol(clientConn, backendConn)
-		})
+		p.handleWireProtocol(clientConn, backendConn)
 	} else {
-		// Simple TCP proxy
-		errCh := make(chan error, 2)
-		safegoroutine.Go(fmt.Sprintf("mongodb-to-backend-%s", clientConn.RemoteAddr()), func() {
-			_, err := io.Copy(backendConn, clientConn)
-			if err != nil && err != io.EOF {
-				log.Printf("MongoDB proxy error copying client->backend: %v", err)
-			}
-			errCh <- err
-		})
-		safegoroutine.Go(fmt.Sprintf("mongodb-to-client-%s", clientConn.RemoteAddr()), func() {
-			_, err := io.Copy(clientConn, backendConn)
-			if err != nil && err != io.EOF {
-				log.Printf("MongoDB proxy error copying backend->client: %v", err)
-			}
-			errCh <- err
-		})
-
-		// Wait for first error
-		err := <-errCh
-		if err != nil && err != io.EOF {
-			log.Printf("MongoDB proxy connection closed with error: %v", err)
-		}
+		// Simple TCP proxy - use BaseProxy's proxyConnections for proper goroutine management
+		p.BaseProxy.proxyConnections(clientConn, backendConn)
 	}
 }
 
@@ -116,15 +95,30 @@ func (p *MongoDBProxy) handleWireProtocol(clientConn, backendConn net.Conn) {
 	// MongoDB wire protocol aware proxying
 	// This allows us to intercept and modify certain commands if needed
 	
-	errCh := make(chan error, 2)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	
+	var wg sync.WaitGroup
+	wg.Add(2)
 	
 	// Client to backend
 	safegoroutine.Go(fmt.Sprintf("mongodb-client-backend-%s", clientConn.RemoteAddr()), func() {
+		defer wg.Done()
 		for {
+			// Check context cancellation
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			
 			// Read MongoDB message header (16 bytes)
 			header := make([]byte, 16)
 			if _, err := io.ReadFull(clientConn, header); err != nil {
-				errCh <- err
+				if err != io.EOF {
+					log.Printf("MongoDB client->backend read error: %v", err)
+				}
+				cancel()
 				return
 			}
 
@@ -135,7 +129,10 @@ func (p *MongoDBProxy) handleWireProtocol(clientConn, backendConn net.Conn) {
 			if msgLen > 16 {
 				body := make([]byte, msgLen-16)
 				if _, err := io.ReadFull(clientConn, body); err != nil {
-					errCh <- err
+					if err != io.EOF {
+						log.Printf("MongoDB client->backend body read error: %v", err)
+					}
+					cancel()
 					return
 				}
 				
@@ -148,17 +145,20 @@ func (p *MongoDBProxy) handleWireProtocol(clientConn, backendConn net.Conn) {
 				
 				// Forward the complete message
 				if _, err := backendConn.Write(header); err != nil {
-					errCh <- err
+					log.Printf("MongoDB client->backend header write error: %v", err)
+					cancel()
 					return
 				}
 				if _, err := backendConn.Write(body); err != nil {
-					errCh <- err
+					log.Printf("MongoDB client->backend body write error: %v", err)
+					cancel()
 					return
 				}
 			} else {
 				// Just the header
 				if _, err := backendConn.Write(header); err != nil {
-					errCh <- err
+					log.Printf("MongoDB client->backend write error: %v", err)
+					cancel()
 					return
 				}
 			}
@@ -167,18 +167,36 @@ func (p *MongoDBProxy) handleWireProtocol(clientConn, backendConn net.Conn) {
 	
 	// Backend to client (simpler, just forward)
 	safegoroutine.Go(fmt.Sprintf("mongodb-backend-client-%s", clientConn.RemoteAddr()), func() {
-		_, err := io.Copy(clientConn, backendConn)
-		if err != nil && err != io.EOF {
-			log.Printf("MongoDB proxy error copying backend->client (wire protocol): %v", err)
+		defer wg.Done()
+		for {
+			// Check context cancellation
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			
+			buffer := make([]byte, 32*1024)
+			n, err := backendConn.Read(buffer)
+			if n > 0 {
+				if _, writeErr := clientConn.Write(buffer[:n]); writeErr != nil {
+					log.Printf("MongoDB backend->client write error: %v", writeErr)
+					cancel()
+					return
+				}
+			}
+			if err != nil {
+				if err != io.EOF {
+					log.Printf("MongoDB backend->client read error: %v", err)
+				}
+				cancel()
+				return
+			}
 		}
-		errCh <- err
 	})
 
-	// Wait for first error
-	err := <-errCh
-	if err != nil && err != io.EOF {
-		log.Printf("MongoDB proxy connection closed with error: %v", err)
-	}
+	// Wait for both goroutines to complete
+	wg.Wait()
 }
 
 // prefixConn wraps a connection and prefixes it with some already-read bytes

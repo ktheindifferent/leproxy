@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"crypto/tls"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"strings"
@@ -54,26 +53,8 @@ func (p *SMTPProxy) handleConnection(clientConn net.Conn) {
 		backendConn = wrappedBackendConn
 	}
 
-	errc := make(chan error, 2)
-	go func() {
-		_, err := io.Copy(backendConn, clientConn)
-		if err != nil && err != io.EOF {
-			log.Printf("SMTP proxy error copying client->backend: %v", err)
-		}
-		errc <- err
-	}()
-	go func() {
-		_, err := io.Copy(clientConn, backendConn)
-		if err != nil && err != io.EOF {
-			log.Printf("SMTP proxy error copying backend->client: %v", err)
-		}
-		errc <- err
-	}()
-
-	// Wait for first error
-	if err := <-errc; err != nil && err != io.EOF {
-		log.Printf("SMTP proxy connection closed with error: %v", err)
-	}
+	// Use BaseProxy's proxyConnections for proper goroutine management
+	p.BaseProxy.proxyConnections(clientConn, backendConn)
 }
 
 func (p *SMTPProxy) handleSTARTTLS(clientConn, backendConn net.Conn) (net.Conn, net.Conn, error) {

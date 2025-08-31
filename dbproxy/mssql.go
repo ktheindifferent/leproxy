@@ -3,7 +3,6 @@ package dbproxy
 import (
 	"crypto/tls"
 	"fmt"
-	"io"
 	"log"
 	"net"
 )
@@ -53,26 +52,8 @@ func (p *MSSQLProxy) handleConnection(clientConn net.Conn) {
 		backendConn = newBackendConn
 	}
 
-	errc := make(chan error, 2)
-	go func() {
-		_, err := io.Copy(backendConn, clientConn)
-		if err != nil && err != io.EOF {
-			log.Printf("MSSQL proxy error copying client->backend: %v", err)
-		}
-		errc <- err
-	}()
-	go func() {
-		_, err := io.Copy(clientConn, backendConn)
-		if err != nil && err != io.EOF {
-			log.Printf("MSSQL proxy error copying backend->client: %v", err)
-		}
-		errc <- err
-	}()
-
-	// Wait for first error
-	if err := <-errc; err != nil && err != io.EOF {
-		log.Printf("MSSQL proxy connection closed with error: %v", err)
-	}
+	// Use BaseProxy's proxyConnections for proper goroutine management
+	p.BaseProxy.proxyConnections(clientConn, backendConn)
 }
 
 func (p *MSSQLProxy) handleTLSNegotiation(clientConn, backendConn net.Conn) (net.Conn, net.Conn, error) {

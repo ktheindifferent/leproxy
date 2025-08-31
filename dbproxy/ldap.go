@@ -3,7 +3,6 @@ package dbproxy
 import (
 	"crypto/tls"
 	"fmt"
-	"io"
 	"log"
 	"net"
 )
@@ -64,17 +63,8 @@ func (p *LDAPProxy) handleConnection(clientConn net.Conn) {
 		wrappedBackendConn = tlsBackendConn
 	}
 
-	errc := make(chan error, 2)
-	go func() {
-		_, err := io.Copy(wrappedBackendConn, wrappedClientConn)
-		errc <- err
-	}()
-	go func() {
-		_, err := io.Copy(wrappedClientConn, wrappedBackendConn)
-		errc <- err
-	}()
-
-	<-errc
+	// Use BaseProxy's proxyConnections for proper goroutine management
+	p.BaseProxy.proxyConnections(wrappedClientConn, wrappedBackendConn)
 }
 
 func (p *LDAPProxy) handleStartTLS(clientConn, backendConn net.Conn) (net.Conn, net.Conn, error) {

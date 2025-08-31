@@ -152,13 +152,9 @@ func (p *BaseProxy) proxyConnections(clientConn, backendConn net.Conn) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 	
-	// Create channels to signal completion
-	done := make(chan struct{}, 2)
-	
 	// Copy data with timeout handling
 	copyWithTimeout := func(dst, src net.Conn, direction string) {
 		defer wg.Done()
-		defer func() { done <- struct{}{} }()
 		
 		err := p.copyDataWithTimeout(ctx, dst, src, direction)
 		if err != nil && err != io.EOF && err != context.Canceled {
