@@ -16,6 +16,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	
+	"github.com/artyom/leproxy/internal/errors"
 )
 
 // Global backuper instance
@@ -328,8 +330,8 @@ func (bm *BackupManager) extractArchive(archivePath string) error {
 				return err
 			}
 			
-			// Copy content
-			if _, err := io.Copy(outFile, tarReader); err != nil {
+			// Copy content with directional context
+			if _, err := errors.CopyWithContext(outFile, tarReader, "tar-archive:"+header.Name, "disk:"+targetPath); err != nil {
 				outFile.Close()
 				return err
 			}
