@@ -11,7 +11,9 @@ import (
 	"strings"
 	"sync"
 	
+	"github.com/artyom/leproxy/internal/errors"
 	"github.com/artyom/leproxy/internal/safegoroutine"
+)
 
 type RedisProxy struct {
 	*BaseProxy
@@ -152,59 +154,11 @@ func (p *RedisProxy) proxyWithReaderContext(ctx context.Context, reader *bufio.R
 		}
 	}
 	
-<<<<<<< HEAD
-	// Then continue with regular copy with context support
-	buffer := make([]byte, 32*1024)
-	for {
-		// Check context cancellation
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-		
-		n, err := reader.Read(buffer)
-		if n > 0 {
-			if _, writeErr := backend.Write(buffer[:n]); writeErr != nil {
-				return writeErr
-			}
-		}
-		if err != nil {
-			if err == io.EOF {
-				return nil
-			}
-			return err
-		}
-	}
-}
-
-func (p *RedisProxy) copyWithContext(ctx context.Context, dst, src net.Conn) error {
-	buffer := make([]byte, 32*1024)
-	for {
-		// Check context cancellation
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-		
-		n, err := src.Read(buffer)
-		if n > 0 {
-			if _, writeErr := dst.Write(buffer[:n]); writeErr != nil {
-				return writeErr
-			}
-		}
-		if err != nil {
-			if err == io.EOF {
-				return nil
-			}
-			return err
-		}
-=======
-	// Then continue with regular copy
-	_, err := io.Copy(backend, reader)
+	// Then continue with regular copy with directional error context
+	_, err := errors.CopyWithContext(backend, reader, "redis-client", "redis-backend")
 	if err != nil && err != io.EOF {
-		log.Printf("Redis proxy error copying client->backend (buffered): %v", err)
->>>>>>> origin/master
+		log.Printf("Redis proxy error: %v", err)
+		return err
 	}
+	return nil
 }

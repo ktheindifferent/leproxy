@@ -391,7 +391,7 @@ func copyFile(src, dst string) error {
 	}
 	defer destination.Close()
 
-	_, err = io.Copy(destination, source)
+	_, err = errors.CopyWithContext(destination, source, "cert-file:"+src, "cert-file:"+dst)
 	return err
 }
 

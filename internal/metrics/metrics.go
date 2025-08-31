@@ -567,6 +567,26 @@ func RecordPanic(goroutineName string, panicMessage string) {
 	}
 }
 
+// RecordCopyError records io.Copy operation errors with directional context
+func RecordCopyError(srcName, dstName, errorType string) {
+	labels := map[string]string{
+		"source":      srcName,
+		"destination": dstName,
+		"error_type":  errorType,
+	}
+	// Use ErrorsTotal with additional labels for copy operations
+	ErrorsTotal.WithLabels(labels).Inc()
+}
+
+// RecordCopyBytes records bytes transferred in copy operations
+func RecordCopyBytes(srcName, dstName string, bytes int64) {
+	labels := map[string]string{
+		"source":      srcName,
+		"destination": dstName,
+	}
+	ProxyBytesTransferred.WithLabels(labels).Add(float64(bytes))
+}
+
 // Server represents a metrics HTTP server
 type Server struct {
 	addr       string
