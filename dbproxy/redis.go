@@ -2,12 +2,16 @@ package dbproxy
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"strings"
-)
+	"sync"
+	
+	"github.com/artyom/leproxy/internal/safegoroutine"
 
 type RedisProxy struct {
 	*BaseProxy
@@ -93,38 +97,39 @@ func (p *RedisProxy) handleConnection(clientConn net.Conn) {
 
 		// For connections that used a reader, we need to handle buffered data
 		if clientReader != nil {
-			errCh := make(chan error, 2)
-			go func() {
-				err := p.proxyWithReader(clientReader, clientConn, backendConn)
-				errCh <- err
-			}()
-			go func() {
-				_, err := io.Copy(clientConn, backendConn)
-				if err != nil && err != io.EOF {
-					log.Printf("Error copying from backend to client: %v", err)
-				}
-				errCh <- err
-			}()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
 			
-			// Wait for either direction to finish
-			<-errCh
+			var wg sync.WaitGroup
+			wg.Add(2)
+			
+			safegoroutine.Go(fmt.Sprintf("redis-proxy-reader-%s", clientConn.RemoteAddr()), func() {
+				defer wg.Done()
+				err := p.proxyWithReaderContext(ctx, clientReader, clientConn, backendConn)
+				if err != nil && err != io.EOF && err != context.Canceled {
+					log.Printf("Redis client->backend error: %v", err)
+				}
+				cancel()
+			})
+			
+			safegoroutine.Go(fmt.Sprintf("redis-proxy-backend-%s", clientConn.RemoteAddr()), func() {
+				defer wg.Done()
+				err := p.copyWithContext(ctx, clientConn, backendConn)
+				if err != nil && err != io.EOF && err != context.Canceled {
+					log.Printf("Redis backend->client error: %v", err)
+				}
+				cancel()
+			})
+			
+			// Wait for both goroutines to complete
+			wg.Wait()
 			return
 		}
 	}
 
 	// Standard bidirectional copy for non-TLS or after TLS negotiation
-	errCh := make(chan error, 2)
-	go func() {
-		_, err := io.Copy(backendConn, clientConn)
-		errCh <- err
-	}()
-	go func() {
-		_, err := io.Copy(clientConn, backendConn)
-		errCh <- err
-	}()
-
-	// Wait for either direction to finish
-	<-errCh
+	// Use BaseProxy's proxyConnections for proper goroutine management
+	p.BaseProxy.proxyConnections(clientConn, backendConn)
 }
 
 func (p *RedisProxy) isStartTLSCommand(data []byte) bool {
@@ -135,7 +140,7 @@ func (p *RedisProxy) isStartTLSCommand(data []byte) bool {
 	return strings.Contains(strings.ToUpper(str), "STARTTLS")
 }
 
-func (p *RedisProxy) proxyWithReader(reader *bufio.Reader, client, backend net.Conn) error {
+func (p *RedisProxy) proxyWithReaderContext(ctx context.Context, reader *bufio.Reader, client, backend net.Conn) error {
 	// First, flush any buffered data
 	if reader.Buffered() > 0 {
 		buffered, err := reader.Peek(reader.Buffered())
@@ -147,10 +152,59 @@ func (p *RedisProxy) proxyWithReader(reader *bufio.Reader, client, backend net.C
 		}
 	}
 	
+<<<<<<< HEAD
+	// Then continue with regular copy with context support
+	buffer := make([]byte, 32*1024)
+	for {
+		// Check context cancellation
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		
+		n, err := reader.Read(buffer)
+		if n > 0 {
+			if _, writeErr := backend.Write(buffer[:n]); writeErr != nil {
+				return writeErr
+			}
+		}
+		if err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return err
+		}
+	}
+}
+
+func (p *RedisProxy) copyWithContext(ctx context.Context, dst, src net.Conn) error {
+	buffer := make([]byte, 32*1024)
+	for {
+		// Check context cancellation
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		
+		n, err := src.Read(buffer)
+		if n > 0 {
+			if _, writeErr := dst.Write(buffer[:n]); writeErr != nil {
+				return writeErr
+			}
+		}
+		if err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return err
+		}
+=======
 	// Then continue with regular copy
 	_, err := io.Copy(backend, reader)
 	if err != nil && err != io.EOF {
-		log.Printf("Error copying from client to backend: %v", err)
+		log.Printf("Redis proxy error copying client->backend (buffered): %v", err)
+>>>>>>> origin/master
 	}
-	return err
 }

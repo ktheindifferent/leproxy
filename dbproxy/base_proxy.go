@@ -13,6 +13,7 @@ import (
 	
 	"github.com/artyom/leproxy/internal/config"
 	"github.com/artyom/leproxy/internal/metrics"
+	"github.com/artyom/leproxy/internal/safegoroutine"
 )
 
 const (
@@ -95,7 +96,9 @@ func (p *BaseProxy) Serve(listener net.Listener) error {
 		if err != nil {
 			return fmt.Errorf("failed to accept connection: %w", err)
 		}
-		go p.handleConnection(clientConn)
+		safegoroutine.Go(fmt.Sprintf("%s-handler-%s", p.Handler.GetProtocolName(), clientConn.RemoteAddr()), func() {
+			p.handleConnection(clientConn)
+		})
 	}
 }
 
@@ -149,13 +152,9 @@ func (p *BaseProxy) proxyConnections(clientConn, backendConn net.Conn) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 	
-	// Create channels to signal completion
-	done := make(chan struct{}, 2)
-	
 	// Copy data with timeout handling
 	copyWithTimeout := func(dst, src net.Conn, direction string) {
 		defer wg.Done()
-		defer func() { done <- struct{}{} }()
 		
 		err := p.copyDataWithTimeout(ctx, dst, src, direction)
 		if err != nil && err != io.EOF && err != context.Canceled {
@@ -167,8 +166,12 @@ func (p *BaseProxy) proxyConnections(clientConn, backendConn net.Conn) {
 		cancel()
 	}
 	
-	go copyWithTimeout(backendConn, clientConn, "client->backend")
-	go copyWithTimeout(clientConn, backendConn, "backend->client")
+	safegoroutine.GoWithContext(ctx, fmt.Sprintf("%s-copy-client-backend", p.Handler.GetProtocolName()), func() {
+		copyWithTimeout(backendConn, clientConn, "client->backend")
+	})
+	safegoroutine.GoWithContext(ctx, fmt.Sprintf("%s-copy-backend-client", p.Handler.GetProtocolName()), func() {
+		copyWithTimeout(clientConn, backendConn, "backend->client")
+	})
 	
 	// Wait for both goroutines to complete
 	wg.Wait()

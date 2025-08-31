@@ -284,7 +284,7 @@ func TestGracefulServerWithActiveConnections(t *testing.T) {
 			defer conn.Close()
 			
 			// Simulate HTTP request
-			conn.Write([]byte("GET / HTTP/1.1\r\nHost: test\r\n\r\n"))
+			_, _ = conn.Write([]byte("GET / HTTP/1.1\r\nHost: test\r\n\r\n")) // Ignore error as connection may be closing
 			time.Sleep(50 * time.Millisecond)
 		}()
 	}

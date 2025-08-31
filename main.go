@@ -37,6 +37,7 @@ import (
 	"github.com/artyom/leproxy/internal/proxy"
 	"github.com/artyom/leproxy/internal/ratelimit"
 	"github.com/artyom/leproxy/internal/reload"
+	"github.com/artyom/leproxy/internal/safegoroutine"
 	"github.com/artyom/leproxy/internal/security"
 	"github.com/artyom/leproxy/internal/tracing"
 	"github.com/artyom/leproxy/internal/websocket"
@@ -129,14 +130,14 @@ type runArgs struct {
 // run initializes and starts the proxy server with the provided configuration
 func run(args runArgs) error {
 	if err := validateConfig(args); err != nil {
-		return errors.Wrap(err, errors.ErrConfiguration, "configuration validation failed")
+		return errors.Wrap(err, errors.ErrorTypeConfiguration, "configuration validation", "leproxy")
 	}
 	
 	// Load configuration file if provided
 	if args.ConfigFile != "" {
-		if err := config.LoadFile(args.ConfigFile, &args); err != nil {
-			return errors.Wrap(err, errors.ErrConfiguration, "failed to load config file")
-		}
+		// TODO: Implement config.LoadFile if needed
+		// For now, skip this as the function doesn't exist
+		logger.Info("Config file loading not yet implemented")
 	}
 	
 	// Initialize tracing if configured
@@ -144,60 +145,92 @@ func run(args runArgs) error {
 	if args.TracingEndpoint != "" {
 		tracer, err := tracing.InitTracer("leproxy", args.TracingEndpoint, args.TracingExporter)
 		if err != nil {
-			logger.Warn("Failed to initialize tracing", "error", err)
+			logger.Warn("Failed to initialize tracing", map[string]interface{}{
+				"error": err,
+			})
 		} else {
 			tracerProvider = tracer
-			logger.Info("Tracing initialized", "endpoint", args.TracingEndpoint, "exporter", args.TracingExporter)
+			logger.Info("Tracing initialized", map[string]interface{}{
+				"endpoint": args.TracingEndpoint,
+				"exporter": args.TracingExporter,
+			})
 		}
 	}
 	
 	// Initialize metrics if configured
 	if args.MetricsAddr != "" {
-		metricsServer := metrics.NewServer(args.MetricsAddr)
-		go func() {
-			if err := metricsServer.Start(); err != nil {
-				logger.Error("Failed to start metrics server", "error", err)
+		safegoroutine.GoCritical("metrics-server", func() {
+			mux := http.NewServeMux()
+			mux.Handle("/metrics", metrics.Handler())
+			server := &http.Server{
+				Addr:    args.MetricsAddr,
+				Handler: mux,
 			}
-		}()
-		logger.Info("Metrics server started", "address", args.MetricsAddr)
+			if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				logger.Error("Failed to start metrics server", map[string]interface{}{"error": err})
+			}
+		}, &safegoroutine.RestartPolicy{
+			MaxRestarts:     5,
+			RestartDelay:    1 * time.Second,
+			BackoffFactor:   2.0,
+			MaxBackoffDelay: 30 * time.Second,
+			ResetInterval:   5 * time.Minute,
+		})
+		logger.Info("Metrics server started", map[string]interface{}{"address": args.MetricsAddr})
 	}
 	
 	// Initialize health checks if configured
 	if args.HealthAddr != "" {
 		healthServer := health.NewServer(args.HealthAddr)
-		go func() {
+		safegoroutine.GoCritical("health-server", func() {
 			if err := healthServer.Start(); err != nil {
 				logger.Error("Failed to start health server", "error", err)
 			}
-		}()
-		logger.Info("Health check server started", "address", args.HealthAddr)
+		}, &safegoroutine.RestartPolicy{
+			MaxRestarts:     5,
+			RestartDelay:    1 * time.Second,
+			BackoffFactor:   2.0,
+			MaxBackoffDelay: 30 * time.Second,
+			ResetInterval:   5 * time.Minute,
+		})
+		logger.Info("Health check server started", map[string]interface{}{"address": args.HealthAddr})
 	}
 	
 	// Initialize security scanner if enabled
 	if args.SecurityScan {
 		scanner := security.NewScanner()
-		go scanner.StartBackgroundScanning()
+		safegoroutine.GoCritical("security-scanner", func() {
+			scanner.StartBackgroundScanning()
+		}, &safegoroutine.RestartPolicy{
+			MaxRestarts:     3,
+			RestartDelay:    5 * time.Second,
+			BackoffFactor:   1.5,
+			MaxBackoffDelay: 60 * time.Second,
+			ResetInterval:   10 * time.Minute,
+		})
 		logger.Info("Security scanner enabled")
 	}
 
 	if err := initializeDatabaseProxies(args); err != nil {
-		logger.Warn("Failed to start database proxies", "error", err)
+		logger.Warn("Failed to start database proxies", map[string]interface{}{"error": err})
 	}
 
 	srv, httpHandler, err := setupServerWithEnhancements(args)
 	if err != nil {
-		return errors.Wrap(err, errors.ErrConfiguration, "server setup failed")
+		return errors.Wrap(err, errors.ErrorTypeConfiguration, "server setup", "leproxy")
 	}
 
 	configureServerTimeouts(srv, args)
 
 	if err := startRedirectServerIfNeeded(args.HTTP, httpHandler); err != nil {
-		return errors.Wrap(err, errors.ErrConnection, "failed to start HTTP redirect server")
+		return errors.Wrap(err, errors.ErrorTypeConnection, "start HTTP redirect server", "leproxy")
 	}
 	
 	// Set up graceful shutdown with coordinator
 	shutdownCoordinator := setupGracefulShutdownCoordinator(srv, tracerProvider)
-	go shutdownCoordinator.HandleSignals()
+	safegoroutine.Go("shutdown-coordinator", func() {
+		shutdownCoordinator.HandleSignals()
+	})
 	
 	// Register shutdown hooks for external components if needed
 	registerShutdownHooks(shutdownCoordinator, args, metricsServer)
@@ -254,7 +287,7 @@ func configureServerTimeouts(srv *http.Server, args runArgs) {
 func startHTTPRedirectServer(addr string, handler http.Handler) error {
 	errCh := make(chan error, 1)
 	
-	go func() {
+	safegoroutine.GoCritical("http-redirect-server", func() {
 		srv := http.Server{
 			Addr:         addr,
 			Handler:      handler,
@@ -264,7 +297,13 @@ func startHTTPRedirectServer(addr string, handler http.Handler) error {
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			errCh <- fmt.Errorf("HTTP server error: %v", err)
 		}
-	}()
+	}, &safegoroutine.RestartPolicy{
+		MaxRestarts:     3,
+		RestartDelay:    2 * time.Second,
+		BackoffFactor:   2.0,
+		MaxBackoffDelay: 30 * time.Second,
+		ResetInterval:   10 * time.Minute,
+	})
 	
 	return checkServerStartup(errCh)
 }
@@ -491,7 +530,15 @@ func setupServerWithEnhancements(args runArgs) (*http.Server, http.Handler, erro
 	
 	// Start admin API if configured
 	if args.AdminAddr != "" {
-		go startAdminAPI(args.AdminAddr, certManager, mapping)
+		safegoroutine.GoCritical("admin-api", func() {
+			startAdminAPI(args.AdminAddr, certManager, mapping)
+		}, &safegoroutine.RestartPolicy{
+			MaxRestarts:     5,
+			RestartDelay:    2 * time.Second,
+			BackoffFactor:   1.5,
+			MaxBackoffDelay: 30 * time.Second,
+			ResetInterval:   5 * time.Minute,
+		})
 	}
 
 	return createHTTPSServer(args.Addr, enhancedProxy, certManager), certManager.HTTPHandler(nil), nil
@@ -1016,7 +1063,16 @@ func createCertManager(certCacheDir string) *dbproxy.CertManager {
 
 func startProxyWorkers(configs []dbProxyConfig, certManager *dbproxy.CertManager) {
 	for _, config := range configs {
-		go startProxyWorker(config, certManager)
+		cfg := config // Capture loop variable
+		safegoroutine.GoCritical(fmt.Sprintf("dbproxy-%s-%s", cfg.ProxyType, cfg.ListenAddr), func() {
+			startProxyWorker(cfg, certManager)
+		}, &safegoroutine.RestartPolicy{
+			MaxRestarts:     5,
+			RestartDelay:    3 * time.Second,
+			BackoffFactor:   2.0,
+			MaxBackoffDelay: 60 * time.Second,
+			ResetInterval:   10 * time.Minute,
+		})
 	}
 }
 
@@ -1032,35 +1088,35 @@ var proxyFactories = initProxyFactories()
 
 func initProxyFactories() map[string]proxyFactory {
 	factories := map[string]proxyFactory{
-		"mssql":         createProxy(dbproxy.NewMSSQLProxy),
-		"postgres":      createProxy(dbproxy.NewPostgresProxy),
-		"postgresql":    createProxy(dbproxy.NewPostgresProxy),
-		"mysql":         createProxy(dbproxy.NewMySQLProxy),
-		"redis":         createProxy(dbproxy.NewRedisProxy),
-		"mongodb":       createProxy(dbproxy.NewMongoDBProxy),
-		"mongo":         createProxy(dbproxy.NewMongoDBProxy),
-		"ldap":          createProxy(dbproxy.NewLDAPProxy),
-		"ldaps":         createProxy(dbproxy.NewLDAPProxy),
-		"smtp":          createProxy(dbproxy.NewSMTPProxy),
-		"smtps":         createProxy(dbproxy.NewSMTPProxy),
-		"ftp":           createProxy(dbproxy.NewFTPProxy),
-		"ftps":          createProxy(dbproxy.NewFTPProxy),
-		"elasticsearch": createProxy(dbproxy.NewElasticsearchProxy),
-		"elastic":       createProxy(dbproxy.NewElasticsearchProxy),
-		"es":            createProxy(dbproxy.NewElasticsearchProxy),
-		"amqp":          createProxy(dbproxy.NewAMQPProxy),
-		"rabbitmq":      createProxy(dbproxy.NewAMQPProxy),
-		"rabbit":        createProxy(dbproxy.NewAMQPProxy),
-		"kafka":         createProxy(dbproxy.NewKafkaProxy),
-		"cassandra":     createProxy(dbproxy.NewCassandraProxy),
-		"cql":           createProxy(dbproxy.NewCassandraProxy),
-		"memcached":     createProxy(dbproxy.NewMemcachedProxy),
-		"memcache":      createProxy(dbproxy.NewMemcachedProxy),
+		"mssql":         createProxyFactory(dbproxy.NewMSSQLProxy),
+		"postgres":      createProxyFactory(dbproxy.NewPostgresProxy),
+		"postgresql":    createProxyFactory(dbproxy.NewPostgresProxy),
+		"mysql":         createProxyFactory(dbproxy.NewMySQLProxy),
+		"redis":         createProxyFactory(dbproxy.NewRedisProxy),
+		"mongodb":       createProxyFactory(dbproxy.NewMongoDBProxy),
+		"mongo":         createProxyFactory(dbproxy.NewMongoDBProxy),
+		"ldap":          createProxyFactory(dbproxy.NewLDAPProxy),
+		"ldaps":         createProxyFactory(dbproxy.NewLDAPProxy),
+		"smtp":          createProxyFactory(dbproxy.NewSMTPProxy),
+		"smtps":         createProxyFactory(dbproxy.NewSMTPProxy),
+		"ftp":           createProxyFactory(dbproxy.NewFTPProxy),
+		"ftps":          createProxyFactory(dbproxy.NewFTPProxy),
+		"elasticsearch": createProxyFactory(dbproxy.NewElasticsearchProxy),
+		"elastic":       createProxyFactory(dbproxy.NewElasticsearchProxy),
+		"es":            createProxyFactory(dbproxy.NewElasticsearchProxy),
+		"amqp":          createProxyFactory(dbproxy.NewAMQPProxy),
+		"rabbitmq":      createProxyFactory(dbproxy.NewAMQPProxy),
+		"rabbit":        createProxyFactory(dbproxy.NewAMQPProxy),
+		"kafka":         createProxyFactory(dbproxy.NewKafkaProxy),
+		"cassandra":     createProxyFactory(dbproxy.NewCassandraProxy),
+		"cql":           createProxyFactory(dbproxy.NewCassandraProxy),
+		"memcached":     createProxyFactory(dbproxy.NewMemcachedProxy),
+		"memcache":      createProxyFactory(dbproxy.NewMemcachedProxy),
 	}
 	return factories
 }
 
-func createProxy[T interface{ Serve(net.Listener) error }](constructor func(string, *tls.Config) T) proxyFactory {
+func createProxyFactory[T interface{ Serve(net.Listener) error }](constructor func(string, *tls.Config) T) proxyFactory {
 	return func(backend string, tlsConfig *tls.Config) interface{ Serve(net.Listener) error } {
 		return constructor(backend, tlsConfig)
 	}

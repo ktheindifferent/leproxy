@@ -9,7 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"filepath"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -319,10 +319,7 @@ func CertificateExpiryCheck(getRenewalStatus func() map[string]interface{}, warn
 			return fmt.Errorf("renewal status function not provided")
 		}
 		
-		statuses, ok := getRenewalStatus().(map[string]interface{})
-		if !ok {
-			return fmt.Errorf("invalid renewal status format")
-		}
+		statuses := getRenewalStatus()
 		
 		var expiringDomains []string
 		var criticalDomains []string

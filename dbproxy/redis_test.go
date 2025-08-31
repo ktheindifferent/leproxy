@@ -70,9 +70,7 @@ func TestRedisProxyWithTLS(t *testing.T) {
 }
 
 func TestRedisIsStartTLSCommand(t *testing.T) {
-	handler := &redisHandler{
-		proxy: &RedisProxy{},
-	}
+	proxy := &RedisProxy{}
 
 	testCases := []struct {
 		name     string
@@ -108,7 +106,7 @@ func TestRedisIsStartTLSCommand(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			result := handler.isStartTLSCommand(tc.data)
+			result := proxy.isStartTLSCommand(tc.data)
 			if result != tc.expected {
 				t.Errorf("Expected %v for %s, got %v", tc.expected, tc.name, result)
 			}
