@@ -17,6 +17,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -135,9 +136,76 @@ func run(args runArgs) error {
 	
 	// Load configuration file if provided
 	if args.ConfigFile != "" {
-		// TODO: Implement config.LoadFile if needed
-		// For now, skip this as the function doesn't exist
-		logger.Info("Config file loading not yet implemented")
+		// Convert runArgs to CLIArgs for merging
+		cliArgs := &config.CLIArgs{
+			HTTPAddr:     args.HTTP,
+			HTTPSAddr:    args.Addr,
+			ACMEProvider: args.Provider,
+			ACMEEmail:    args.Email,
+			ACMECacheDir: args.Cache,
+			TestMode:     args.TestMode,
+			EABKID:       args.EABKID,
+			EABHMAC:      args.EABHMAC,
+			ReadTimeout:  args.RTo,
+			WriteTimeout: args.WTo,
+			IdleTimeout:  args.Idle,
+			LogLevel:     args.LogLevel,
+			LogFormat:    args.LogFormat,
+			RateLimit:    args.RateLimit,
+			BurstLimit:   args.BurstLimit,
+			DDoSEnabled:  args.DDoSProtect,
+		}
+		
+		// Check if metrics is enabled
+		if args.MetricsAddr != "" {
+			cliArgs.MetricsEnabled = true
+			// Parse port from address if provided
+			if _, portStr, err := net.SplitHostPort(args.MetricsAddr); err == nil {
+				if port, err := strconv.Atoi(portStr); err == nil {
+					cliArgs.MetricsPort = port
+				}
+			}
+		}
+		
+		// Check if tracing is enabled
+		if args.TracingEndpoint != "" {
+			cliArgs.TracingEnabled = true
+			cliArgs.TracingEndpoint = args.TracingEndpoint
+		}
+		
+		cfg, err := config.LoadFile(args.ConfigFile, cliArgs)
+		if err != nil {
+			logger.Error("Failed to load config file", map[string]interface{}{
+				"file": args.ConfigFile,
+				"error": err,
+			})
+			// Continue with CLI args only, don't fail completely
+		} else {
+			logger.Info("Config file loaded successfully", map[string]interface{}{
+				"file": args.ConfigFile,
+			})
+			
+			// Update args from loaded config where CLI didn't override
+			// This allows the loaded config to set values not specified via CLI
+			if args.HTTP == ":http" && cfg.Server.HTTPAddr != "" {
+				args.HTTP = cfg.Server.HTTPAddr
+			}
+			if args.Addr == ":https" && cfg.Server.HTTPSAddr != "" {
+				args.Addr = cfg.Server.HTTPSAddr
+			}
+			if args.Provider == "letsencrypt" && cfg.Server.ACME.Provider != "" {
+				args.Provider = cfg.Server.ACME.Provider
+			}
+			if args.Email == "" && cfg.Server.ACME.Email != "" {
+				args.Email = cfg.Server.ACME.Email
+			}
+			if args.LogLevel == "info" && cfg.Logging.Level != "" {
+				args.LogLevel = cfg.Logging.Level
+			}
+			if args.LogFormat == "text" && cfg.Logging.Format != "" {
+				args.LogFormat = cfg.Logging.Format
+			}
+		}
 	}
 	
 	// Initialize tracing if configured

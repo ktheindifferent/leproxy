@@ -536,6 +536,196 @@ func isValidDBType(dbType string) bool {
 	return false
 }
 
+// LoadFile loads configuration from a file and merges it with the provided command-line arguments
+// CLI arguments take precedence over file configuration
+func LoadFile(path string, cliArgs interface{}) (*Config, error) {
+	// First load the configuration from file
+	config, err := LoadConfig(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load config file: %w", err)
+	}
+	
+	// Merge with CLI arguments if provided
+	if cliArgs != nil {
+		if err := mergeWithCLIArgs(config, cliArgs); err != nil {
+			return nil, fmt.Errorf("failed to merge CLI arguments: %w", err)
+		}
+	}
+	
+	// Validate the final configuration
+	if err := config.Validate(); err != nil {
+		return nil, fmt.Errorf("config validation failed: %w", err)
+	}
+	
+	return config, nil
+}
+
+// mergeWithCLIArgs merges command-line arguments into the configuration
+// CLI arguments take precedence over file configuration
+func mergeWithCLIArgs(config *Config, cliArgs interface{}) error {
+	// This implementation expects cliArgs to be a map or a struct that can be converted to a map
+	// containing the CLI argument values
+	
+	switch args := cliArgs.(type) {
+	case map[string]interface{}:
+		return mergeFromMap(config, args)
+	case *CLIArgs:
+		return mergeFromCLIArgs(config, args)
+	default:
+		// If we don't recognize the type, we skip merging
+		// This allows the function to be called with nil or unsupported types
+		return nil
+	}
+}
+
+// CLIArgs represents the command-line arguments that can override config file settings
+type CLIArgs struct {
+	// Server settings
+	HTTPAddr  string
+	HTTPSAddr string
+	
+	// ACME settings
+	ACMEProvider string
+	ACMEEmail    string
+	ACMECacheDir string
+	TestMode     bool
+	EABKID       string
+	EABHMAC      string
+	
+	// Timeouts
+	ReadTimeout  time.Duration
+	WriteTimeout time.Duration
+	IdleTimeout  time.Duration
+	
+	// Logging
+	LogLevel  string
+	LogFormat string
+	
+	// Metrics
+	MetricsEnabled bool
+	MetricsPort    int
+	
+	// Security
+	RateLimit    int
+	BurstLimit   int
+	DDoSEnabled  bool
+	
+	// Advanced
+	TracingEnabled   bool
+	TracingEndpoint  string
+}
+
+// mergeFromCLIArgs merges specific CLI arguments into the configuration
+func mergeFromCLIArgs(config *Config, args *CLIArgs) error {
+	// Server configuration
+	if args.HTTPAddr != "" {
+		config.Server.HTTPAddr = args.HTTPAddr
+	}
+	if args.HTTPSAddr != "" {
+		config.Server.HTTPSAddr = args.HTTPSAddr
+	}
+	
+	// ACME configuration
+	if args.ACMEProvider != "" {
+		config.Server.ACME.Provider = args.ACMEProvider
+	}
+	if args.ACMEEmail != "" {
+		config.Server.ACME.Email = args.ACMEEmail
+	}
+	if args.ACMECacheDir != "" {
+		config.Server.ACME.CacheDir = args.ACMECacheDir
+	}
+	if args.TestMode {
+		config.Server.ACME.TestMode = args.TestMode
+	}
+	if args.EABKID != "" {
+		config.Server.ACME.EABKID = args.EABKID
+	}
+	if args.EABHMAC != "" {
+		config.Server.ACME.EABHMAC = args.EABHMAC
+	}
+	
+	// Timeouts
+	if args.ReadTimeout > 0 {
+		config.Server.ReadTimeout = Duration(args.ReadTimeout)
+	}
+	if args.WriteTimeout > 0 {
+		config.Server.WriteTimeout = Duration(args.WriteTimeout)
+	}
+	if args.IdleTimeout > 0 {
+		config.Server.IdleTimeout = Duration(args.IdleTimeout)
+	}
+	
+	// Logging
+	if args.LogLevel != "" {
+		config.Logging.Level = args.LogLevel
+	}
+	if args.LogFormat != "" {
+		config.Logging.Format = args.LogFormat
+	}
+	
+	// Metrics
+	if args.MetricsEnabled {
+		config.Metrics.Enabled = true
+	}
+	if args.MetricsPort > 0 {
+		config.Metrics.Port = args.MetricsPort
+	}
+	
+	// Security
+	if args.RateLimit > 0 {
+		config.Security.RateLimit.RequestsPerSecond = args.RateLimit
+		config.Security.RateLimit.Enabled = true
+	}
+	if args.BurstLimit > 0 {
+		config.Security.RateLimit.Burst = args.BurstLimit
+	}
+	config.Security.DDoSProtection.Enabled = args.DDoSEnabled
+	
+	// Tracing
+	if args.TracingEnabled {
+		config.Advanced.Tracing.Enabled = true
+	}
+	if args.TracingEndpoint != "" {
+		// Determine the exporter type based on the endpoint
+		if strings.Contains(args.TracingEndpoint, "jaeger") {
+			config.Advanced.Tracing.ExporterType = "jaeger"
+			config.Advanced.Tracing.JaegerEndpoint = args.TracingEndpoint
+		} else {
+			config.Advanced.Tracing.ExporterType = "otlp"
+			config.Advanced.Tracing.OTLPEndpoint = args.TracingEndpoint
+		}
+	}
+	
+	return nil
+}
+
+// mergeFromMap merges a map of values into the configuration
+func mergeFromMap(config *Config, values map[string]interface{}) error {
+	// This is a generic implementation that can handle various map structures
+	// You can extend this based on your specific needs
+	
+	if server, ok := values["server"].(map[string]interface{}); ok {
+		if httpAddr, ok := server["http_addr"].(string); ok && httpAddr != "" {
+			config.Server.HTTPAddr = httpAddr
+		}
+		if httpsAddr, ok := server["https_addr"].(string); ok && httpsAddr != "" {
+			config.Server.HTTPSAddr = httpsAddr
+		}
+	}
+	
+	if logging, ok := values["logging"].(map[string]interface{}); ok {
+		if level, ok := logging["level"].(string); ok && level != "" {
+			config.Logging.Level = level
+		}
+		if format, ok := logging["format"].(string); ok && format != "" {
+			config.Logging.Format = format
+		}
+	}
+	
+	return nil
+}
+
 // GenerateSchema generates a JSON schema for the configuration
 func GenerateSchema() map[string]interface{} {
 	return map[string]interface{}{

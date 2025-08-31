@@ -1,0 +1,99 @@
+{
+  "server": {
+    "http_addr": ":8080",
+    "https_addr": ":8443",
+    "read_timeout": "30s",
+    "write_timeout": "1m",
+    "idle_timeout": "2m",
+    "acme": {
+      "provider": "letsencrypt",
+      "email": "admin@example.com",
+      "cache_dir": "/var/cache/certs",
+      "test_mode": false,
+      "renew_before_days": 30
+    }
+  },
+  "mappings": {
+    "example.com": {
+      "url": "http://localhost:3000",
+      "health_check": "/health",
+      "max_connections": 100,
+      "connect_timeout": "10s",
+      "request_timeout": "30s",
+      "retry_attempts": 3,
+      "retry_delay": "1s"
+    },
+    "api.example.com": {
+      "url": "http://localhost:4000",
+      "headers": {
+        "X-Forwarded-Proto": "https",
+        "X-Custom-Header": "value"
+      },
+      "websocket_path": "/ws",
+      "max_connections": 200
+    }
+  },
+  "database_proxies": [
+    {
+      "name": "postgres-main",
+      "type": "postgres",
+      "listen": "0.0.0.0:5433",
+      "backend": "localhost:5432",
+      "tls": true,
+      "pool": {
+        "enabled": true,
+        "min_conns": 5,
+        "max_conns": 20,
+        "max_lifetime": "30m",
+        "idle_timeout": "5m"
+      }
+    }
+  ],
+  "security": {
+    "hsts": {
+      "enabled": true,
+      "max_age": 31536000,
+      "include_subdomains": true,
+      "preload": false
+    },
+    "rate_limit": {
+      "enabled": true,
+      "requests_per_second": 100,
+      "burst": 200,
+      "ttl": "3m",
+      "blacklist_ttl": "1h"
+    },
+    "ddos_protection": {
+      "enabled": true,
+      "max_connections_per_ip": 100,
+      "detection_window": "10s",
+      "detection_threshold": 50,
+      "auto_blacklist_enabled": true,
+      "auto_blacklist_duration": "1h"
+    }
+  },
+  "logging": {
+    "level": "info",
+    "format": "json",
+    "output": "stdout"
+  },
+  "metrics": {
+    "enabled": true,
+    "endpoint": "/metrics",
+    "port": 9090
+  },
+  "advanced": {
+    "graceful_shutdown_timeout": "30s",
+    "enable_profiling": false,
+    "profiling_port": 6060,
+    "max_header_bytes": 1048576,
+    "disable_http2": false,
+    "tracing": {
+      "enabled": false,
+      "service_name": "leproxy",
+      "environment": "production",
+      "exporter_type": "jaeger",
+      "sample_rate": 1.0
+    }
+  }
+}
