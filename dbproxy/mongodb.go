@@ -11,6 +11,7 @@ import (
 	"sync"
 	
 	"github.com/artyom/leproxy/internal/safegoroutine"
+)
 
 type MongoDBProxy struct {
 	*BaseProxy

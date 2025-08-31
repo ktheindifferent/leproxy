@@ -12,6 +12,7 @@ import (
 	"sync"
 	
 	"github.com/artyom/leproxy/internal/safegoroutine"
+)
 
 type RedisProxy struct {
 	*BaseProxy
@@ -152,7 +153,6 @@ func (p *RedisProxy) proxyWithReaderContext(ctx context.Context, reader *bufio.R
 		}
 	}
 	
-<<<<<<< HEAD
 	// Then continue with regular copy with context support
 	buffer := make([]byte, 32*1024)
 	for {
@@ -200,11 +200,5 @@ func (p *RedisProxy) copyWithContext(ctx context.Context, dst, src net.Conn) err
 			}
 			return err
 		}
-=======
-	// Then continue with regular copy
-	_, err := io.Copy(backend, reader)
-	if err != nil && err != io.EOF {
-		log.Printf("Redis proxy error copying client->backend (buffered): %v", err)
->>>>>>> origin/master
 	}
 }
