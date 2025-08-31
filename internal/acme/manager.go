@@ -3,8 +3,11 @@ package acme
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -16,6 +19,19 @@ import (
 	"golang.org/x/crypto/acme"
 	"golang.org/x/crypto/acme/autocert"
 )
+
+// Global manager instance
+var globalManager *Manager
+
+// GetGlobalManager returns the global ACME manager instance
+func GetGlobalManager() *Manager {
+	return globalManager
+}
+
+// SetGlobalManager sets the global ACME manager instance
+func SetGlobalManager(manager *Manager) {
+	globalManager = manager
+}
 
 // Config holds ACME configuration
 type Config struct {
@@ -472,4 +488,79 @@ func GetAvailableProviders() []ProviderInfo {
 		*GetProviderInfo(ProviderEntrust),
 		*GetProviderInfo(ProviderGoogle),
 	}
+}
+
+// CleanupExpired removes expired certificates from the cache
+func (m *Manager) CleanupExpired() error {
+	if m.config.CacheDir == "" {
+		return nil
+	}
+	
+	files, err := ioutil.ReadDir(m.config.CacheDir)
+	if err != nil {
+		return fmt.Errorf("failed to read cache directory: %w", err)
+	}
+	
+	var removedCount int
+	for _, file := range files {
+		if file.IsDir() {
+			continue
+		}
+		
+		// Only process certificate files
+		if !strings.HasSuffix(file.Name(), "+rsa") && !strings.HasSuffix(file.Name(), "+ecdsa") {
+			continue
+		}
+		
+		certPath := filepath.Join(m.config.CacheDir, file.Name())
+		
+		// Read certificate
+		certPEM, err := ioutil.ReadFile(certPath)
+		if err != nil {
+			logger.Warn("Failed to read certificate file", map[string]interface{}{
+				"file": file.Name(),
+				"error": err,
+			})
+			continue
+		}
+		
+		// Parse certificate
+		block, _ := pem.Decode(certPEM)
+		if block == nil {
+			continue
+		}
+		
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			logger.Warn("Failed to parse certificate", map[string]interface{}{
+				"file": file.Name(),
+				"error": err,
+			})
+			continue
+		}
+		
+		// Check if expired
+		if time.Now().After(cert.NotAfter) {
+			if err := os.Remove(certPath); err != nil {
+				logger.Error("Failed to remove expired certificate", map[string]interface{}{
+					"file": file.Name(),
+					"error": err,
+				})
+			} else {
+				removedCount++
+				logger.Info("Removed expired certificate", map[string]interface{}{
+					"file": file.Name(),
+					"expired": cert.NotAfter,
+				})
+			}
+		}
+	}
+	
+	if removedCount > 0 {
+		logger.Info("Certificate cleanup completed", map[string]interface{}{
+			"removed": removedCount,
+		})
+	}
+	
+	return nil
 }

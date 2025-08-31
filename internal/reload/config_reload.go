@@ -453,3 +453,16 @@ func getClientIP(req *http.Request) string {
 	host, _, _ := strings.Cut(req.RemoteAddr, ":")
 	return host
 }
+
+// Global reloader instance for singleton pattern
+var globalReloader *ConfigReloader
+
+// GetGlobalReloader returns the global config reloader instance
+func GetGlobalReloader() *ConfigReloader {
+	return globalReloader
+}
+
+// SetGlobalReloader sets the global config reloader instance
+func SetGlobalReloader(reloader *ConfigReloader) {
+	globalReloader = reloader
+}

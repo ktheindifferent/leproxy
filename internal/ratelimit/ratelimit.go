@@ -9,6 +9,19 @@ import (
 	"time"
 )
 
+// Global rate limiter instance
+var globalLimiter *Limiter
+
+// GetGlobalLimiter returns the global rate limiter instance
+func GetGlobalLimiter() *Limiter {
+	return globalLimiter
+}
+
+// SetGlobalLimiter sets the global rate limiter instance
+func SetGlobalLimiter(limiter *Limiter) {
+	globalLimiter = limiter
+}
+
 type Limiter struct {
 	visitors map[string]*Visitor
 	mu       sync.RWMutex
@@ -25,6 +38,10 @@ type Limiter struct {
 	enabled           bool
 	whitelistedIPs    map[string]bool
 	whitelistedRanges []*net.IPNet
+	
+	// Cleanup goroutine control
+	stopCh chan struct{}
+	wg     sync.WaitGroup
 }
 
 type Visitor struct {
@@ -273,6 +290,14 @@ func (l *Limiter) Stats() Stats {
 		ActiveVisitors: len(l.visitors),
 		BlacklistedIPs: len(l.blacklist),
 		SuspiciousIPs:  len(l.suspiciousIPs),
+	}
+}
+
+// Stop gracefully stops the rate limiter and its cleanup goroutine
+func (l *Limiter) Stop() {
+	if l.stopCh != nil {
+		close(l.stopCh)
+		l.wg.Wait()
 	}
 }
 

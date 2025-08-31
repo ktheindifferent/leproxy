@@ -529,6 +529,11 @@ func (p *Pool) Stats() PoolStats {
 	}
 }
 
+// GetStats returns current pool statistics (alias for Stats for consistency)
+func (p *Pool) GetStats() PoolStats {
+	return p.Stats()
+}
+
 // GetLeakedConnections returns connections that are currently active (not returned to pool)
 func (p *Pool) GetLeakedConnections() []*PooledConn {
 	// Check pool state first

@@ -18,6 +18,24 @@ import (
 	"time"
 )
 
+// Global backuper instance
+var globalBackuper *Backuper
+
+// Backuper interface for certificate backup operations
+type Backuper interface {
+	BackupAll() error
+}
+
+// GetGlobalBackuper returns the global certificate backuper instance
+func GetGlobalBackuper() *Backuper {
+	return globalBackuper
+}
+
+// SetGlobalBackuper sets the global certificate backuper instance
+func SetGlobalBackuper(backuper *Backuper) {
+	globalBackuper = backuper
+}
+
 // BackupManager manages certificate backups
 type BackupManager struct {
 	certDir       string
@@ -78,6 +96,12 @@ func NewBackupManager(cfg Config) (*BackupManager, error) {
 	go bm.cleanupLoop()
 	
 	return bm, nil
+}
+
+// BackupAll creates a backup of all certificates
+func (bm *BackupManager) BackupAll() error {
+	_, err := bm.Backup()
+	return err
 }
 
 // Backup creates a backup of all certificates
