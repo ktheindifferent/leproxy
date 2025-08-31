@@ -60,7 +60,9 @@ func TestRenewalManagerInitialization(t *testing.T) {
 				tempDir := t.TempDir()
 				// Create corrupted history file
 				historyFile := filepath.Join(tempDir, "renewal_history.json")
-				os.WriteFile(historyFile, []byte("corrupted json data"), 0600)
+				if err := os.WriteFile(historyFile, []byte("corrupted json data"), 0600); err != nil {
+					t.Fatalf("Failed to write corrupted history file: %v", err)
+				}
 				
 				config := &Config{
 					CacheDir: tempDir,

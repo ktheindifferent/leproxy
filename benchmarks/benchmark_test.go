@@ -37,7 +37,7 @@ func BenchmarkHTTPProxy(b *testing.B) {
 		defer resp.Body.Close()
 
 		w.WriteHeader(resp.StatusCode)
-		io.Copy(w, resp.Body)
+		_, _ = io.Copy(w, resp.Body) // Ignore error in benchmark
 	})
 
 	b.ResetTimer()
@@ -68,7 +68,7 @@ func BenchmarkHTTPProxyWithMiddleware(b *testing.B) {
 		defer resp.Body.Close()
 		
 		w.WriteHeader(resp.StatusCode)
-		io.Copy(w, resp.Body)
+		_, _ = io.Copy(w, resp.Body) // Ignore error in benchmark
 	})
 
 	// Add middleware layers
@@ -188,7 +188,7 @@ func BenchmarkTLSHandshake(b *testing.B) {
 			go func(c net.Conn) {
 				defer c.Close()
 				// Simple echo server
-				io.Copy(c, c)
+				_, _ = io.Copy(c, c) // Ignore error in benchmark
 			}(conn)
 		}
 	}()
@@ -259,7 +259,7 @@ func BenchmarkLargePayloadProxy(b *testing.B) {
 				defer resp.Body.Close()
 
 				w.WriteHeader(resp.StatusCode)
-				io.Copy(w, resp.Body)
+				_, _ = io.Copy(w, resp.Body) // Ignore error in benchmark
 			})
 
 			b.SetBytes(int64(size))
@@ -355,7 +355,7 @@ func BenchmarkBufferCopy(b *testing.B) {
 				src.Seek(0, 0)
 				dst := &bytes.Buffer{}
 				buf := make([]byte, bufSize)
-				io.CopyBuffer(dst, src, buf)
+				_, _ = io.CopyBuffer(dst, src, buf) // Ignore error in benchmark
 			}
 		})
 	}
