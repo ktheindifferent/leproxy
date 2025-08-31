@@ -12,6 +12,7 @@ import (
 	"time"
 	
 	"github.com/artyom/leproxy/internal/config"
+	// "github.com/artyom/leproxy/internal/logger"
 	"github.com/artyom/leproxy/internal/metrics"
 	"github.com/artyom/leproxy/internal/safegoroutine"
 )
@@ -38,6 +39,13 @@ type BaseProxy struct {
 	Handler        ProxyHandler
 	TimeoutConfig  *config.ProxyTimeoutConfig
 	timeoutMetrics *TimeoutMetrics
+	connTracker    interface{} // Will be set by proxy package
+	shutdownCtx    context.Context
+	shutdownCancel context.CancelFunc
+	listener       net.Listener
+	listenerMu     sync.RWMutex
+	closed         atomic.Bool
+	proxyType      string // Type as string to avoid import cycle
 }
 
 // TimeoutMetrics tracks timeout-related metrics
@@ -50,6 +58,7 @@ type TimeoutMetrics struct {
 }
 
 func NewBaseProxy(backend string, tlsConfig *tls.Config, handler ProxyHandler) *BaseProxy {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &BaseProxy{
 		Backend:        backend,
 		TLSConfig:      tlsConfig,
@@ -57,6 +66,9 @@ func NewBaseProxy(backend string, tlsConfig *tls.Config, handler ProxyHandler) *
 		Handler:        handler,
 		TimeoutConfig:  defaultTimeoutConfig(),
 		timeoutMetrics: &TimeoutMetrics{},
+		connTracker:    nil, // Will be set by caller
+		shutdownCtx:    ctx,
+		shutdownCancel: cancel,
 	}
 }
 
@@ -65,6 +77,7 @@ func NewBaseProxyWithTimeout(backend string, tlsConfig *tls.Config, handler Prox
 	if timeoutConfig == nil {
 		timeoutConfig = defaultTimeoutConfig()
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	return &BaseProxy{
 		Backend:        backend,
 		TLSConfig:      tlsConfig,
@@ -72,6 +85,9 @@ func NewBaseProxyWithTimeout(backend string, tlsConfig *tls.Config, handler Prox
 		Handler:        handler,
 		TimeoutConfig:  timeoutConfig,
 		timeoutMetrics: &TimeoutMetrics{},
+		connTracker:    nil, // Will be set by caller
+		shutdownCtx:    ctx,
+		shutdownCancel: cancel,
 	}
 }
 
@@ -91,11 +107,36 @@ func defaultTimeoutConfig() *config.ProxyTimeoutConfig {
 }
 
 func (p *BaseProxy) Serve(listener net.Listener) error {
+	p.listenerMu.Lock()
+	p.listener = listener
+	p.listenerMu.Unlock()
+	
 	for {
+		// Check if we're shutting down
+		select {
+		case <-p.shutdownCtx.Done():
+			return fmt.Errorf("proxy shutting down")
+		default:
+		}
+		
 		clientConn, err := listener.Accept()
 		if err != nil {
+			// Check if this is due to listener being closed
+			if p.closed.Load() {
+				return nil
+			}
+			// Check for temporary errors
+			if netErr, ok := err.(net.Error); ok && netErr.Temporary() {
+				// logger.Warn("Temporary accept error", map[string]interface{}{
+				// 	"error": err,
+				// 	"protocol": p.Handler.GetProtocolName(),
+				// })
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
 			return fmt.Errorf("failed to accept connection: %w", err)
 		}
+		
 		safegoroutine.Go(fmt.Sprintf("%s-handler-%s", p.Handler.GetProtocolName(), clientConn.RemoteAddr()), func() {
 			p.handleConnection(clientConn)
 		})
@@ -335,6 +376,61 @@ func (p *BaseProxy) GetTimeoutMetrics() map[string]uint64 {
 		"total_bytes":    p.timeoutMetrics.TotalBytes.Load(),
 		"retries":        p.timeoutMetrics.Retries.Load(),
 	}
+}
+
+// SetProxyType sets the proxy type for metrics and tracking
+func (p *BaseProxy) SetProxyType(proxyType string) {
+	p.proxyType = proxyType
+}
+
+// SetConnectionTracker sets a custom connection tracker
+func (p *BaseProxy) SetConnectionTracker(tracker interface{}) {
+	if tracker != nil {
+		p.connTracker = tracker
+	}
+}
+
+// IsHealthy checks if the proxy is healthy
+func (p *BaseProxy) IsHealthy() bool {
+	return !p.closed.Load()
+}
+
+// GracefulShutdown performs a graceful shutdown of the proxy
+func (p *BaseProxy) GracefulShutdown(timeout time.Duration) error {
+	if p.closed.Load() {
+		return fmt.Errorf("proxy already closed")
+	}
+	
+	p.closed.Store(true)
+	// logger.Info("Starting graceful shutdown", map[string]interface{}{
+	// 	"protocol": p.Handler.GetProtocolName(),
+	// })
+	
+	// Close the listener to stop accepting new connections
+	p.listenerMu.Lock()
+	listener := p.listener
+	p.listenerMu.Unlock()
+	
+	if listener != nil {
+		if err := listener.Close(); err != nil {
+			// logger.Warn("Error closing listener", map[string]interface{}{
+			// 	"error": err,
+			// })
+		}
+	}
+	
+	// Cancel the shutdown context to signal all goroutines
+	p.shutdownCancel()
+	
+	// Wait for timeout
+	time.Sleep(timeout)
+	
+	return nil
+}
+
+// Close immediately closes the proxy without graceful shutdown
+func (p *BaseProxy) Close() error {
+	return p.GracefulShutdown(1 * time.Second)
 }
 
 func (p *BaseProxy) UpgradeToTLS(conn net.Conn) (*tls.Conn, error) {
