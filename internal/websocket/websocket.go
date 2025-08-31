@@ -198,7 +198,7 @@ func (wp *WSProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}()
 	
 	// Create a context with cancellation
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	
 	// Bidirectional proxy with context
@@ -215,7 +215,7 @@ func (wp *WSProxy) connectToBackend(r *http.Request) (net.Conn, error) {
 		}
 	}
 	
-	ctx, cancel := context.WithTimeout(context.Background(), wp.dialTimeout)
+	ctx, cancel := context.WithTimeout(r.Context(), wp.dialTimeout)
 	defer cancel()
 	
 	dialer := &net.Dialer{}

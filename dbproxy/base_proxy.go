@@ -38,6 +38,7 @@ type BaseProxy struct {
 	Handler        ProxyHandler
 	TimeoutConfig  *config.ProxyTimeoutConfig
 	timeoutMetrics *TimeoutMetrics
+	ctx            context.Context
 }
 
 // TimeoutMetrics tracks timeout-related metrics
@@ -50,6 +51,10 @@ type TimeoutMetrics struct {
 }
 
 func NewBaseProxy(backend string, tlsConfig *tls.Config, handler ProxyHandler) *BaseProxy {
+	return NewBaseProxyWithContext(context.Background(), backend, tlsConfig, handler)
+}
+
+func NewBaseProxyWithContext(ctx context.Context, backend string, tlsConfig *tls.Config, handler ProxyHandler) *BaseProxy {
 	return &BaseProxy{
 		Backend:        backend,
 		TLSConfig:      tlsConfig,
@@ -57,11 +62,17 @@ func NewBaseProxy(backend string, tlsConfig *tls.Config, handler ProxyHandler) *
 		Handler:        handler,
 		TimeoutConfig:  defaultTimeoutConfig(),
 		timeoutMetrics: &TimeoutMetrics{},
+		ctx:            ctx,
 	}
 }
 
 // NewBaseProxyWithTimeout creates a new BaseProxy with custom timeout configuration
 func NewBaseProxyWithTimeout(backend string, tlsConfig *tls.Config, handler ProxyHandler, timeoutConfig *config.ProxyTimeoutConfig) *BaseProxy {
+	return NewBaseProxyWithTimeoutAndContext(context.Background(), backend, tlsConfig, handler, timeoutConfig)
+}
+
+// NewBaseProxyWithTimeoutAndContext creates a new BaseProxy with custom timeout configuration and context
+func NewBaseProxyWithTimeoutAndContext(ctx context.Context, backend string, tlsConfig *tls.Config, handler ProxyHandler, timeoutConfig *config.ProxyTimeoutConfig) *BaseProxy {
 	if timeoutConfig == nil {
 		timeoutConfig = defaultTimeoutConfig()
 	}
@@ -72,6 +83,7 @@ func NewBaseProxyWithTimeout(backend string, tlsConfig *tls.Config, handler Prox
 		Handler:        handler,
 		TimeoutConfig:  timeoutConfig,
 		timeoutMetrics: &TimeoutMetrics{},
+		ctx:            ctx,
 	}
 }
 
@@ -91,18 +103,37 @@ func defaultTimeoutConfig() *config.ProxyTimeoutConfig {
 }
 
 func (p *BaseProxy) Serve(listener net.Listener) error {
+	return p.ServeWithContext(p.ctx, listener)
+}
+
+func (p *BaseProxy) ServeWithContext(ctx context.Context, listener net.Listener) error {
 	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		
 		clientConn, err := listener.Accept()
 		if err != nil {
-			return fmt.Errorf("failed to accept connection: %w", err)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+				return fmt.Errorf("failed to accept connection: %w", err)
+			}
 		}
-		safegoroutine.Go(fmt.Sprintf("%s-handler-%s", p.Handler.GetProtocolName(), clientConn.RemoteAddr()), func() {
-			p.handleConnection(clientConn)
+		safegoroutine.GoWithContext(ctx, fmt.Sprintf("%s-handler-%s", p.Handler.GetProtocolName(), clientConn.RemoteAddr()), func() {
+			p.handleConnectionWithContext(ctx, clientConn)
 		})
 	}
 }
 
 func (p *BaseProxy) handleConnection(clientConn net.Conn) {
+	p.handleConnectionWithContext(p.ctx, clientConn)
+}
+
+func (p *BaseProxy) handleConnectionWithContext(ctx context.Context, clientConn net.Conn) {
 	defer clientConn.Close()
 
 	backendConn, err := p.connectToBackend()
@@ -120,7 +151,7 @@ func (p *BaseProxy) handleConnection(clientConn net.Conn) {
 		return
 	}
 
-	p.proxyConnections(clientConn, backendConn)
+	p.proxyConnectionsWithContext(ctx, clientConn, backendConn)
 }
 
 func (p *BaseProxy) connectToBackend() (net.Conn, error) {
@@ -146,7 +177,11 @@ func (p *BaseProxy) connectToBackend() (net.Conn, error) {
 }
 
 func (p *BaseProxy) proxyConnections(clientConn, backendConn net.Conn) {
-	ctx, cancel := context.WithCancel(context.Background())
+	p.proxyConnectionsWithContext(p.ctx, clientConn, backendConn)
+}
+
+func (p *BaseProxy) proxyConnectionsWithContext(ctx context.Context, clientConn, backendConn net.Conn) {
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	
 	var wg sync.WaitGroup

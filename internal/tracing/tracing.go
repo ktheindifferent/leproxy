@@ -48,6 +48,10 @@ type TracerProvider struct {
 
 // NewTracerProvider creates a new tracer provider
 func NewTracerProvider(cfg Config) (*TracerProvider, error) {
+	return NewTracerProviderWithContext(context.Background(), cfg)
+}
+
+func NewTracerProviderWithContext(ctx context.Context, cfg Config) (*TracerProvider, error) {
 	if !cfg.Enabled {
 		// Return no-op provider if tracing is disabled
 		return &TracerProvider{
@@ -76,7 +80,7 @@ func NewTracerProvider(cfg Config) (*TracerProvider, error) {
 	case "jaeger":
 		exporter, err = createJaegerExporter(cfg)
 	case "otlp":
-		exporter, err = createOTLPExporter(cfg)
+		exporter, err = createOTLPExporterWithContext(ctx, cfg)
 	default:
 		// Use stdout exporter as fallback
 		exporter, err = createStdoutExporter()
@@ -157,6 +161,10 @@ func createJaegerExporter(cfg Config) (sdktrace.SpanExporter, error) {
 
 // createOTLPExporter creates an OTLP exporter
 func createOTLPExporter(cfg Config) (sdktrace.SpanExporter, error) {
+	return createOTLPExporterWithContext(context.Background(), cfg)
+}
+
+func createOTLPExporterWithContext(ctx context.Context, cfg Config) (sdktrace.SpanExporter, error) {
 	endpoint := cfg.OTLPEndpoint
 	if endpoint == "" {
 		endpoint = "localhost:4317"
@@ -175,7 +183,7 @@ func createOTLPExporter(cfg Config) (sdktrace.SpanExporter, error) {
 	}
 	
 	client := otlptracegrpc.NewClient(opts...)
-	return otlptrace.New(context.Background(), client)
+	return otlptrace.New(ctx, client)
 }
 
 // createStdoutExporter creates a stdout exporter for debugging
@@ -402,6 +410,10 @@ func ExtractHTTPHeaders(ctx context.Context, headers http.Header) context.Contex
 
 // InitTracer initializes a new tracer provider with the given configuration
 func InitTracer(serviceName, endpoint, exporterType string) (*TracerProvider, error) {
+	return InitTracerWithContext(context.Background(), serviceName, endpoint, exporterType)
+}
+
+func InitTracerWithContext(ctx context.Context, serviceName, endpoint, exporterType string) (*TracerProvider, error) {
 	// Determine sample rate based on environment
 	sampleRate := 1.0 // Default to sampling everything
 	if os.Getenv("OTEL_TRACE_SAMPLE_RATE") != "" {
@@ -442,5 +454,5 @@ func InitTracer(serviceName, endpoint, exporterType string) (*TracerProvider, er
 		config.ExporterType = "stdout"
 	}
 	
-	return NewTracerProvider(config)
+	return NewTracerProviderWithContext(ctx, config)
 }

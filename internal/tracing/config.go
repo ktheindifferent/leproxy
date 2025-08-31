@@ -232,7 +232,7 @@ func (cv *ConfigValidator) validateOTLPEndpoint(cfg *ExtendedConfig) error {
 
 // checkDNS checks if a hostname can be resolved
 func (cv *ConfigValidator) checkDNS(host string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.TODO(), 3*time.Second) // TODO: Pass context from validator initialization
 	defer cancel()
 	
 	resolver := &net.Resolver{}
