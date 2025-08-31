@@ -553,3 +553,15 @@ func RecordRetry(proxyType string, direction string) {
 	}
 	ProxyRetriesTotal.WithLabels(labels).Inc()
 }
+
+// RecordPanic records goroutine panic metrics
+func RecordPanic(goroutineName string, panicMessage string) {
+	labels := map[string]string{
+		"goroutine": goroutineName,
+		"panic":     panicMessage,
+	}
+	// Use an existing counter or create one
+	if counter := Get("goroutine_panics_total"); counter != nil {
+		counter.WithLabels(labels).Inc()
+	}
+}
