@@ -1,13 +1,17 @@
 package proxy
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/artyom/leproxy/dbproxy"
 	"github.com/artyom/leproxy/internal/logger"
+	"github.com/artyom/leproxy/internal/safegoroutine"
 )
 
 // Type represents the database proxy type
@@ -57,10 +61,11 @@ type ProxyCreator func(config *Config) (Proxy, error)
 
 // Proxy interface for all database proxies
 type Proxy interface {
-	Start() error
+	Start(ctx context.Context) error
 	Stop() error
 	GetType() Type
 	GetListenAddr() string
+	GetActiveConnections() int32
 }
 
 // NewFactory creates a new proxy factory
@@ -170,12 +175,17 @@ func SetGlobalManager(manager *ProxyManager) {
 
 // StartProxy starts a new proxy instance
 func (m *ProxyManager) StartProxy(config *Config) error {
+	return m.StartProxyWithContext(context.Background(), config)
+}
+
+// StartProxyWithContext starts a new proxy instance with context
+func (m *ProxyManager) StartProxyWithContext(ctx context.Context, config *Config) error {
 	proxy, err := m.factory.Create(config)
 	if err != nil {
 		return fmt.Errorf("failed to create proxy: %w", err)
 	}
 
-	if err := proxy.Start(); err != nil {
+	if err := proxy.Start(ctx); err != nil {
 		return fmt.Errorf("failed to start proxy: %w", err)
 	}
 
@@ -235,6 +245,7 @@ func (m *ProxyManager) GetStatus() map[string]ProxyStatus {
 			Type:       proxy.GetType(),
 			ListenAddr: proxy.GetListenAddr(),
 			Running:    true,
+			Connections: int(proxy.GetActiveConnections()),
 		}
 	}
 	return status
@@ -253,9 +264,13 @@ type ProxyStatus struct {
 // Base proxy implementations
 
 type baseProxy struct {
-	config   *Config
-	listener net.Listener
-	stopped  chan struct{}
+	config            *Config
+	listener          net.Listener
+	stopped           chan struct{}
+	ctx               context.Context
+	cancel            context.CancelFunc
+	activeConnections atomic.Int32
+	connectionWg      sync.WaitGroup
 }
 
 func (p *baseProxy) GetType() Type {
@@ -266,11 +281,70 @@ func (p *baseProxy) GetListenAddr() string {
 	return p.config.ListenAddr
 }
 
+func (p *baseProxy) GetActiveConnections() int32 {
+	return p.activeConnections.Load()
+}
+
 func (p *baseProxy) Stop() error {
-	if p.listener != nil {
-		return p.listener.Close()
+	// Signal shutdown
+	if p.cancel != nil {
+		p.cancel()
 	}
-	return nil
+	
+	// Close the listener to stop accepting new connections
+	var err error
+	if p.listener != nil {
+		err = p.listener.Close()
+	}
+	
+	// Wait for all active connections to complete
+	p.connectionWg.Wait()
+	
+	return err
+}
+
+// acceptLoop handles incoming connections with proper lifecycle management
+func (p *baseProxy) acceptLoop(handler func(net.Conn)) {
+	for {
+		select {
+		case <-p.ctx.Done():
+			logger.Info("Accept loop shutting down",
+				"type", p.config.Type,
+				"listen", p.config.ListenAddr)
+			return
+		default:
+			conn, err := p.listener.Accept()
+			if err != nil {
+				// Check if this is a normal shutdown
+				if errors.Is(err, net.ErrClosed) {
+					logger.Debug("Listener closed",
+						"type", p.config.Type,
+						"listen", p.config.ListenAddr)
+				} else {
+					logger.Error("Accept error",
+						"type", p.config.Type,
+						"listen", p.config.ListenAddr,
+						"error", err)
+				}
+				return
+			}
+			
+			// Track connection
+			p.activeConnections.Add(1)
+			p.connectionWg.Add(1)
+			
+			// Handle connection in a safe goroutine
+			safegoroutine.GoWithContext(p.ctx, 
+				fmt.Sprintf("%s-handler-%s", p.config.Type, conn.RemoteAddr()),
+				func() {
+					defer func() {
+						p.activeConnections.Add(-1)
+						p.connectionWg.Done()
+					}()
+					handler(conn)
+				})
+		}
+	}
 }
 
 // Specific proxy implementations
@@ -280,22 +354,22 @@ type mysqlProxy struct {
 	proxy *dbproxy.MySQLProxy
 }
 
-func (p *mysqlProxy) Start() error {
+func (p *mysqlProxy) Start(ctx context.Context) error {
 	ln, err := net.Listen("tcp", p.config.ListenAddr)
 	if err != nil {
 		return err
 	}
 	p.listener = ln
+	p.ctx, p.cancel = context.WithCancel(ctx)
+	p.stopped = make(chan struct{})
 	
-	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go p.proxy.Handle(conn)
-		}
-	}()
+	// Start accept loop in a safe goroutine
+	safegoroutine.GoWithContext(p.ctx,
+		fmt.Sprintf("mysql-accept-%s", p.config.ListenAddr),
+		func() {
+			defer close(p.stopped)
+			p.acceptLoop(p.proxy.Handle)
+		})
 	
 	return nil
 }
@@ -305,22 +379,22 @@ type postgresProxy struct {
 	proxy *dbproxy.PostgresProxy
 }
 
-func (p *postgresProxy) Start() error {
+func (p *postgresProxy) Start(ctx context.Context) error {
 	ln, err := net.Listen("tcp", p.config.ListenAddr)
 	if err != nil {
 		return err
 	}
 	p.listener = ln
+	p.ctx, p.cancel = context.WithCancel(ctx)
+	p.stopped = make(chan struct{})
 	
-	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go p.proxy.Handle(conn)
-		}
-	}()
+	// Start accept loop in a safe goroutine
+	safegoroutine.GoWithContext(p.ctx,
+		fmt.Sprintf("postgres-accept-%s", p.config.ListenAddr),
+		func() {
+			defer close(p.stopped)
+			p.acceptLoop(p.proxy.Handle)
+		})
 	
 	return nil
 }
@@ -330,22 +404,22 @@ type mongoProxy struct {
 	proxy *dbproxy.MongoDBProxy
 }
 
-func (p *mongoProxy) Start() error {
+func (p *mongoProxy) Start(ctx context.Context) error {
 	ln, err := net.Listen("tcp", p.config.ListenAddr)
 	if err != nil {
 		return err
 	}
 	p.listener = ln
+	p.ctx, p.cancel = context.WithCancel(ctx)
+	p.stopped = make(chan struct{})
 	
-	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go p.proxy.Handle(conn)
-		}
-	}()
+	// Start accept loop in a safe goroutine
+	safegoroutine.GoWithContext(p.ctx,
+		fmt.Sprintf("mongodb-accept-%s", p.config.ListenAddr),
+		func() {
+			defer close(p.stopped)
+			p.acceptLoop(p.proxy.Handle)
+		})
 	
 	return nil
 }
@@ -355,22 +429,22 @@ type redisProxy struct {
 	proxy *dbproxy.RedisProxy
 }
 
-func (p *redisProxy) Start() error {
+func (p *redisProxy) Start(ctx context.Context) error {
 	ln, err := net.Listen("tcp", p.config.ListenAddr)
 	if err != nil {
 		return err
 	}
 	p.listener = ln
+	p.ctx, p.cancel = context.WithCancel(ctx)
+	p.stopped = make(chan struct{})
 	
-	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go p.proxy.Handle(conn)
-		}
-	}()
+	// Start accept loop in a safe goroutine
+	safegoroutine.GoWithContext(p.ctx,
+		fmt.Sprintf("redis-accept-%s", p.config.ListenAddr),
+		func() {
+			defer close(p.stopped)
+			p.acceptLoop(p.proxy.Handle)
+		})
 	
 	return nil
 }
