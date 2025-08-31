@@ -104,13 +104,16 @@ func (p *RedisProxy) handleConnection(clientConn net.Conn) {
 			safegoroutine.Go(fmt.Sprintf("redis-proxy-backend-%s", clientConn.RemoteAddr()), func() {
 				_, err := io.Copy(clientConn, backendConn)
 				if err != nil && err != io.EOF {
-					log.Printf("Error copying from backend to client: %v", err)
+					log.Printf("Redis proxy error copying backend->client: %v", err)
 				}
 				errCh <- err
 			})
 			
-			// Wait for either direction to finish
-			<-errCh
+			// Wait for first error
+			err := <-errCh
+			if err != nil && err != io.EOF {
+				log.Printf("Redis proxy connection closed with error: %v", err)
+			}
 			return
 		}
 	}
@@ -119,15 +122,23 @@ func (p *RedisProxy) handleConnection(clientConn net.Conn) {
 	errCh := make(chan error, 2)
 	safegoroutine.Go(fmt.Sprintf("redis-copy-to-backend-%s", clientConn.RemoteAddr()), func() {
 		_, err := io.Copy(backendConn, clientConn)
+		if err != nil && err != io.EOF {
+			log.Printf("Redis proxy error copying client->backend: %v", err)
+		}
 		errCh <- err
 	})
 	safegoroutine.Go(fmt.Sprintf("redis-copy-to-client-%s", clientConn.RemoteAddr()), func() {
 		_, err := io.Copy(clientConn, backendConn)
+		if err != nil && err != io.EOF {
+			log.Printf("Redis proxy error copying backend->client: %v", err)
+		}
 		errCh <- err
 	})
 
-	// Wait for either direction to finish
-	<-errCh
+	// Wait for first error
+	if err := <-errCh; err != nil && err != io.EOF {
+		log.Printf("Redis proxy connection closed with error: %v", err)
+	}
 }
 
 func (p *RedisProxy) isStartTLSCommand(data []byte) bool {
@@ -153,7 +164,7 @@ func (p *RedisProxy) proxyWithReader(reader *bufio.Reader, client, backend net.C
 	// Then continue with regular copy
 	_, err := io.Copy(backend, reader)
 	if err != nil && err != io.EOF {
-		log.Printf("Error copying from client to backend: %v", err)
+		log.Printf("Redis proxy error copying client->backend (buffered): %v", err)
 	}
 	return err
 }

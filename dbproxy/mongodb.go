@@ -91,15 +91,24 @@ func (p *MongoDBProxy) handleConnection(clientConn net.Conn) {
 		errCh := make(chan error, 2)
 		safegoroutine.Go(fmt.Sprintf("mongodb-to-backend-%s", clientConn.RemoteAddr()), func() {
 			_, err := io.Copy(backendConn, clientConn)
+			if err != nil && err != io.EOF {
+				log.Printf("MongoDB proxy error copying client->backend: %v", err)
+			}
 			errCh <- err
 		})
 		safegoroutine.Go(fmt.Sprintf("mongodb-to-client-%s", clientConn.RemoteAddr()), func() {
 			_, err := io.Copy(clientConn, backendConn)
+			if err != nil && err != io.EOF {
+				log.Printf("MongoDB proxy error copying backend->client: %v", err)
+			}
 			errCh <- err
 		})
 
-		// Wait for either direction to finish
-		<-errCh
+		// Wait for first error
+		err := <-errCh
+		if err != nil && err != io.EOF {
+			log.Printf("MongoDB proxy connection closed with error: %v", err)
+		}
 	}
 }
 
@@ -159,11 +168,17 @@ func (p *MongoDBProxy) handleWireProtocol(clientConn, backendConn net.Conn) {
 	// Backend to client (simpler, just forward)
 	safegoroutine.Go(fmt.Sprintf("mongodb-backend-client-%s", clientConn.RemoteAddr()), func() {
 		_, err := io.Copy(clientConn, backendConn)
+		if err != nil && err != io.EOF {
+			log.Printf("MongoDB proxy error copying backend->client (wire protocol): %v", err)
+		}
 		errCh <- err
 	})
 
-	// Wait for either direction to finish
-	<-errCh
+	// Wait for first error
+	err := <-errCh
+	if err != nil && err != io.EOF {
+		log.Printf("MongoDB proxy connection closed with error: %v", err)
+	}
 }
 
 // prefixConn wraps a connection and prefixes it with some already-read bytes
