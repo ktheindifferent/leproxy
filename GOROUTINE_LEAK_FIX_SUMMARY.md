@@ -1,131 +1,132 @@
-# Goroutine Leak Fix Summary
+# Goroutine Leak Fix in Proxy Factory
 
-## Overview
-Fixed critical goroutine leak issues in all database proxy implementations by implementing proper lifecycle management, context cancellation, and timeout mechanisms.
+## Problem Statement
+The proxy factory implementations in `internal/proxy/factory.go` had goroutines that ran Accept() loops without proper lifecycle management. When Accept() returned an error, the goroutines would simply return without cleanup or notification, leading to potential goroutine leaks.
 
-## Changes Made
+## Solution Implemented
 
-### 1. Enhanced BaseProxy (dbproxy/base_proxy.go)
-- **Added context.Context support** for cancellation propagation
-- **Implemented WaitGroup tracking** for all spawned goroutines
-- **Added connection counting** with atomic operations
-- **Implemented graceful shutdown** with timeout support
-- **Added configurable timeouts**:
-  - ConnectTimeout (default: 10s)
-  - IdleTimeout (default: 5m)
-  - ReadTimeout (default: 30s)
-  - WriteTimeout (default: 30s)
-- **Added connection lifecycle management** with proper cleanup
-- **Implemented force-close on shutdown** to unblock hanging connections
+### 1. Added Context Support
+- Modified the `Proxy` interface to accept a context in the `Start()` method
+- Added `StartProxyWithContext()` method to `ProxyManager`
+- Each proxy now maintains its own context and cancellation function
 
-### 2. Updated Database Proxies
-Refactored all database proxies to use the enhanced BaseProxy:
+### 2. Implemented Proper Shutdown Coordination
+- Added `baseProxy` fields for lifecycle management:
+  - `ctx`: Context for cancellation
+  - `cancel`: Cancel function for signaling shutdown
+  - `activeConnections`: Atomic counter for tracking connections
+  - `connectionWg`: WaitGroup for graceful shutdown
+  - `stopped`: Channel to signal completion
 
-#### PostgreSQL (dbproxy/postgres.go)
-- Refactored to use BaseProxy with postgresHandler
-- Added context support to SSL negotiation
-- Implemented connection pooling with lifecycle management
-- Added timeouts for all network operations
+### 3. Created Centralized Accept Loop
+- Implemented `acceptLoop()` method in `baseProxy` that:
+  - Respects context cancellation
+  - Logs errors appropriately (distinguishing between normal shutdown and actual errors)
+  - Tracks active connections
+  - Uses safegoroutine for panic recovery
 
-#### MySQL (dbproxy/mysql.go)
-- Refactored to use BaseProxy with mysqlHandler
-- Added context-aware protocol negotiation
-- Implemented connection pooling with health checks
-- Added timeout helpers for read/write operations
+### 4. Enhanced Connection Tracking
+- Each accepted connection increments `activeConnections` counter
+- Connection handlers decrement counter on completion
+- `GetActiveConnections()` method added to Proxy interface
+- Graceful shutdown waits for all connections to complete
 
-#### Redis (dbproxy/redis.go)
-- Refactored to use BaseProxy with redisHandler
-- Added context support for STARTTLS negotiation
-- Implemented connection pooling with periodic PING health checks
-- Added proper cleanup for health checker goroutine
+### 5. Improved Error Handling
+- Accept errors are now properly logged with context
+- Distinguishes between `net.ErrClosed` (normal shutdown) and actual errors
+- Uses structured logging with type, address, and error details
 
-### 3. Connection Pooling
-Implemented connection pools for all database types with:
-- Maximum connection limits
-- Idle connection timeout
-- Atomic in-use tracking
-- Stale connection cleanup
-- Health checking (Redis)
+## Code Changes
 
-### 4. Testing Infrastructure (dbproxy/goroutine_leak_test.go)
-Created comprehensive test suite including:
-- **TestBaseProxyGoroutineLeaks**: Basic goroutine leak detection
-- **TestProxyWithConnectionFailures**: Handling of backend failures
-- **TestProxyIdleTimeout**: Idle connection timeout verification
-- **TestConcurrentShutdown**: Graceful shutdown under load
-- **Database-specific tests** for PostgreSQL, MySQL, and Redis
-- **Benchmark tests** for throughput measurement
+### Modified Files:
+1. **internal/proxy/factory.go**:
+   - Added context, errors, and sync/atomic imports
+   - Updated Proxy interface with context support and connection tracking
+   - Enhanced baseProxy with lifecycle management fields
+   - Implemented centralized acceptLoop method
+   - Updated all proxy implementations (mysql, postgres, mongodb, redis)
+   - Used safegoroutine for panic recovery
+
+### New Test File:
+2. **internal/proxy/factory_goroutine_test.go**:
+   - `TestProxyGoroutineCleanup`: Verifies goroutines are cleaned up properly
+   - `TestProxyAcceptErrorHandling`: Tests error handling in accept loops
+   - `TestProxyGracefulShutdown`: Verifies graceful shutdown with active connections
+   - `TestConcurrentProxyOperations`: Tests concurrent start/stop operations
+   - `TestProxyManagerStopAll`: Tests stopping all proxies at once
+   - `TestContextCancellation`: Tests context cancellation handling
 
 ## Key Improvements
 
-### Goroutine Management
-- All goroutines are properly tracked with sync.WaitGroup
-- Context cancellation propagates to all child operations
-- Shutdown signal cleanly terminates all goroutines
-- No goroutines can leak after connection close
-
-### Timeout Handling
-- All network operations have configurable timeouts
-- Read/write deadlines prevent hanging connections
-- Idle connections are automatically closed
-- TLS handshakes have explicit timeouts
-
-### Resource Cleanup
-- Deferred cleanup ensures resources are always released
-- Active connection counter tracks all connections
-- Graceful shutdown waits for connections to close
-- Force-close mechanism for hanging connections
-
-## Testing Results
-The implementation has been tested with:
-- Multiple concurrent connections
-- Connection failures and timeouts
-- Graceful shutdown scenarios
-- High connection churn
-- Goroutine leak detection
-
-## Performance Considerations
-- 32KB buffer size for optimal throughput
-- Connection pooling reduces overhead
-- Atomic operations for thread-safe counters
-- Minimal lock contention in critical paths
-
-## Future Improvements
-1. Consider implementing connection pool warming
-2. Add metrics for connection pool utilization
-3. Implement adaptive timeout adjustments
-4. Add circuit breaker pattern for backend failures
-5. Consider implementing connection multiplexing for supported protocols
-
-## Migration Guide
-Existing code using database proxies should be updated:
-
+### Before:
 ```go
-// Old
-proxy := &PostgresProxy{
-    Backend: "localhost:5432",
-    TLSConfig: tlsConfig,
-}
-
-// New
-proxy := NewPostgresProxy("localhost:5432", tlsConfig)
-// Optionally configure timeouts
-proxy.IdleTimeout = 10 * time.Minute
-proxy.ReadTimeout = 1 * time.Minute
-
-// Graceful shutdown
-ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-defer cancel()
-if err := proxy.Shutdown(ctx); err != nil {
-    log.Printf("Shutdown error: %v", err)
-}
+go func() {
+    for {
+        conn, err := ln.Accept()
+        if err != nil {
+            return  // Silent failure, goroutine leak!
+        }
+        go p.proxy.Handle(conn)
+    }
+}()
 ```
 
-## Conclusion
-The goroutine leak issues have been comprehensively addressed through:
-1. Proper lifecycle management with context and WaitGroups
-2. Timeout mechanisms at all network boundaries
-3. Graceful shutdown with force-close fallback
-4. Comprehensive testing to verify the fixes
+### After:
+```go
+safegoroutine.GoWithContext(p.ctx,
+    fmt.Sprintf("mysql-accept-%s", p.config.ListenAddr),
+    func() {
+        defer close(p.stopped)
+        p.acceptLoop(p.proxy.Handle)
+    })
+```
 
-All database proxies now properly manage goroutine lifecycles, preventing leaks and ensuring clean shutdown.
+## Benefits
+
+1. **No Goroutine Leaks**: Proper cleanup ensures goroutines are terminated
+2. **Graceful Shutdown**: Active connections are allowed to complete
+3. **Better Observability**: Error logging and connection tracking
+4. **Panic Recovery**: Using safegoroutine prevents crashes
+5. **Context Support**: Respects cancellation for clean shutdown
+6. **Testability**: Comprehensive test suite to prevent regressions
+
+## Testing
+
+The implementation includes comprehensive tests that verify:
+- Goroutines are properly cleaned up on shutdown
+- No leaks occur during normal operation
+- Accept errors are handled correctly
+- Graceful shutdown works with active connections
+- Concurrent operations don't cause leaks
+- Context cancellation is respected
+
+## Migration Guide
+
+For code using the old API:
+```go
+// Old way
+proxy.Start()
+
+// New way
+proxy.Start(context.Background())
+// Or with context
+ctx, cancel := context.WithCancel(context.Background())
+proxy.Start(ctx)
+```
+
+## Monitoring
+
+The enhanced implementation provides:
+- Active connection count via `GetActiveConnections()`
+- Structured logging for all accept errors
+- Connection lifecycle tracking
+- Graceful shutdown coordination
+
+## Future Improvements
+
+Potential enhancements could include:
+1. Metrics collection for connection statistics
+2. Health check endpoints
+3. Connection pooling limits
+4. Rate limiting support
+5. Circuit breaker integration
