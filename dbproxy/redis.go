@@ -4,12 +4,14 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"strings"
 	"sync"
-)
+	
+	"github.com/artyom/leproxy/internal/safegoroutine"
 
 type RedisProxy struct {
 	*BaseProxy
@@ -101,23 +103,23 @@ func (p *RedisProxy) handleConnection(clientConn net.Conn) {
 			var wg sync.WaitGroup
 			wg.Add(2)
 			
-			go func() {
+			safegoroutine.Go(fmt.Sprintf("redis-proxy-reader-%s", clientConn.RemoteAddr()), func() {
 				defer wg.Done()
 				err := p.proxyWithReaderContext(ctx, clientReader, clientConn, backendConn)
 				if err != nil && err != io.EOF && err != context.Canceled {
 					log.Printf("Redis client->backend error: %v", err)
 				}
 				cancel()
-			}()
+			})
 			
-			go func() {
+			safegoroutine.Go(fmt.Sprintf("redis-proxy-backend-%s", clientConn.RemoteAddr()), func() {
 				defer wg.Done()
 				err := p.copyWithContext(ctx, clientConn, backendConn)
 				if err != nil && err != io.EOF && err != context.Canceled {
 					log.Printf("Redis backend->client error: %v", err)
 				}
 				cancel()
-			}()
+			})
 			
 			// Wait for both goroutines to complete
 			wg.Wait()
@@ -150,6 +152,7 @@ func (p *RedisProxy) proxyWithReaderContext(ctx context.Context, reader *bufio.R
 		}
 	}
 	
+<<<<<<< HEAD
 	// Then continue with regular copy with context support
 	buffer := make([]byte, 32*1024)
 	for {
@@ -197,5 +200,11 @@ func (p *RedisProxy) copyWithContext(ctx context.Context, dst, src net.Conn) err
 			}
 			return err
 		}
+=======
+	// Then continue with regular copy
+	_, err := io.Copy(backend, reader)
+	if err != nil && err != io.EOF {
+		log.Printf("Redis proxy error copying client->backend (buffered): %v", err)
+>>>>>>> origin/master
 	}
 }

@@ -4,11 +4,13 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"sync"
-)
+	
+	"github.com/artyom/leproxy/internal/safegoroutine"
 
 type MongoDBProxy struct {
 	*BaseProxy
@@ -100,7 +102,7 @@ func (p *MongoDBProxy) handleWireProtocol(clientConn, backendConn net.Conn) {
 	wg.Add(2)
 	
 	// Client to backend
-	go func() {
+	safegoroutine.Go(fmt.Sprintf("mongodb-client-backend-%s", clientConn.RemoteAddr()), func() {
 		defer wg.Done()
 		for {
 			// Check context cancellation
@@ -161,10 +163,10 @@ func (p *MongoDBProxy) handleWireProtocol(clientConn, backendConn net.Conn) {
 				}
 			}
 		}
-	}()
+	})
 	
 	// Backend to client (simpler, just forward)
-	go func() {
+	safegoroutine.Go(fmt.Sprintf("mongodb-backend-client-%s", clientConn.RemoteAddr()), func() {
 		defer wg.Done()
 		for {
 			// Check context cancellation
@@ -191,7 +193,7 @@ func (p *MongoDBProxy) handleWireProtocol(clientConn, backendConn net.Conn) {
 				return
 			}
 		}
-	}()
+	})
 
 	// Wait for both goroutines to complete
 	wg.Wait()
